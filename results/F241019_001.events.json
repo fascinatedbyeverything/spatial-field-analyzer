@@ -1,0 +1,517 @@
+{
+  "duration_sec" : 90.8,
+  "events" : [
+    {
+      "confidence" : 0.328,
+      "end_sec" : 1.95,
+      "label" : "wind",
+      "start_sec" : 0.975
+    },
+    {
+      "confidence" : 0.37,
+      "end_sec" : 8.775,
+      "label" : "wind",
+      "start_sec" : 4.875
+    },
+    {
+      "confidence" : 0.412,
+      "end_sec" : 10.237499999999999,
+      "label" : "speech",
+      "start_sec" : 9.2625
+    },
+    {
+      "confidence" : 0.435,
+      "end_sec" : 13.1625,
+      "label" : "water",
+      "start_sec" : 9.75
+    },
+    {
+      "confidence" : 0.49,
+      "end_sec" : 16.087500000000002,
+      "label" : "speech",
+      "start_sec" : 14.625
+    },
+    {
+      "confidence" : 0.406,
+      "end_sec" : 18.0375,
+      "label" : "bird_vocalization",
+      "start_sec" : 17.0625
+    },
+    {
+      "confidence" : 0.342,
+      "end_sec" : 18.525000000000002,
+      "label" : "bird",
+      "start_sec" : 17.55
+    },
+    {
+      "confidence" : 0.474,
+      "end_sec" : 19.012500000000003,
+      "label" : "bird_vocalization",
+      "start_sec" : 18.0375
+    },
+    {
+      "confidence" : 0.386,
+      "end_sec" : 23.887500000000003,
+      "label" : "water",
+      "start_sec" : 20.9625
+    },
+    {
+      "confidence" : 0.365,
+      "end_sec" : 27.3,
+      "label" : "wind",
+      "start_sec" : 26.325
+    },
+    {
+      "confidence" : 0.435,
+      "end_sec" : 29.7375,
+      "label" : "bird_vocalization",
+      "start_sec" : 27.3
+    },
+    {
+      "confidence" : 0.466,
+      "end_sec" : 30.712500000000002,
+      "label" : "wind",
+      "start_sec" : 29.25
+    },
+    {
+      "confidence" : 0.709,
+      "end_sec" : 31.200000000000003,
+      "label" : "wind_rustling_leaves",
+      "start_sec" : 30.225
+    },
+    {
+      "confidence" : 0.497,
+      "end_sec" : 32.6625,
+      "label" : "wind",
+      "start_sec" : 30.7125
+    },
+    {
+      "confidence" : 0.581,
+      "end_sec" : 33.15,
+      "label" : "wind_rustling_leaves",
+      "start_sec" : 32.175
+    },
+    {
+      "confidence" : 0.552,
+      "end_sec" : 34.612500000000004,
+      "label" : "wind",
+      "start_sec" : 32.6625
+    },
+    {
+      "confidence" : 0.628,
+      "end_sec" : 35.1,
+      "label" : "wind_rustling_leaves",
+      "start_sec" : 34.125
+    },
+    {
+      "confidence" : 0.463,
+      "end_sec" : 35.5875,
+      "label" : "wind",
+      "start_sec" : 34.6125
+    },
+    {
+      "confidence" : 0.397,
+      "end_sec" : 36.075,
+      "label" : "wind_rustling_leaves",
+      "start_sec" : 35.1
+    },
+    {
+      "confidence" : 0.42,
+      "end_sec" : 37.050000000000004,
+      "label" : "wind",
+      "start_sec" : 36.075
+    },
+    {
+      "confidence" : 0.469,
+      "end_sec" : 38.025,
+      "label" : "wind_rustling_leaves",
+      "start_sec" : 36.5625
+    },
+    {
+      "confidence" : 0.441,
+      "end_sec" : 39.487500000000004,
+      "label" : "wind",
+      "start_sec" : 37.5375
+    },
+    {
+      "confidence" : 0.373,
+      "end_sec" : 39.975,
+      "label" : "wind_rustling_leaves",
+      "start_sec" : 39
+    },
+    {
+      "confidence" : 0.432,
+      "end_sec" : 41.925000000000004,
+      "label" : "wind",
+      "start_sec" : 39.4875
+    },
+    {
+      "confidence" : 0.362,
+      "end_sec" : 43.875,
+      "label" : "wind_rustling_leaves",
+      "start_sec" : 42.9
+    },
+    {
+      "confidence" : 0.361,
+      "end_sec" : 45.3375,
+      "label" : "wind",
+      "start_sec" : 43.875
+    },
+    {
+      "confidence" : 0.557,
+      "end_sec" : 46.3125,
+      "label" : "wind_rustling_leaves",
+      "start_sec" : 44.85
+    },
+    {
+      "confidence" : 0.429,
+      "end_sec" : 47.2875,
+      "label" : "wind",
+      "start_sec" : 46.3125
+    },
+    {
+      "confidence" : 0.302,
+      "end_sec" : 47.775,
+      "label" : "wind_rustling_leaves",
+      "start_sec" : 46.8
+    },
+    {
+      "confidence" : 0.358,
+      "end_sec" : 48.75,
+      "label" : "bell",
+      "start_sec" : 47.775
+    },
+    {
+      "confidence" : 0.316,
+      "end_sec" : 49.237500000000004,
+      "label" : "chime",
+      "start_sec" : 48.2625
+    },
+    {
+      "confidence" : 0.369,
+      "end_sec" : 51.1875,
+      "label" : "wind",
+      "start_sec" : 50.2125
+    },
+    {
+      "confidence" : 0.629,
+      "end_sec" : 51.675000000000004,
+      "label" : "bird_vocalization",
+      "start_sec" : 50.7
+    },
+    {
+      "confidence" : 0.331,
+      "end_sec" : 52.1625,
+      "label" : "wind",
+      "start_sec" : 51.1875
+    },
+    {
+      "confidence" : 0.404,
+      "end_sec" : 52.65,
+      "label" : "rail_transport",
+      "start_sec" : 51.675
+    },
+    {
+      "confidence" : 0.343,
+      "end_sec" : 53.1375,
+      "label" : "thunder",
+      "start_sec" : 52.1625
+    },
+    {
+      "confidence" : 0.366,
+      "end_sec" : 53.625,
+      "label" : "bird",
+      "start_sec" : 52.65
+    },
+    {
+      "confidence" : 0.401,
+      "end_sec" : 56.0625,
+      "label" : "wind_rustling_leaves",
+      "start_sec" : 55.0875
+    },
+    {
+      "confidence" : 0.329,
+      "end_sec" : 57.0375,
+      "label" : "bird",
+      "start_sec" : 56.0625
+    },
+    {
+      "confidence" : 0.423,
+      "end_sec" : 57.525,
+      "label" : "bird_vocalization",
+      "start_sec" : 56.55
+    },
+    {
+      "confidence" : 0.361,
+      "end_sec" : 58.0125,
+      "label" : "bird",
+      "start_sec" : 57.0375
+    },
+    {
+      "confidence" : 0.522,
+      "end_sec" : 58.5,
+      "label" : "bird_vocalization",
+      "start_sec" : 57.525
+    },
+    {
+      "confidence" : 0.529,
+      "end_sec" : 59.9625,
+      "label" : "bird",
+      "start_sec" : 58.5
+    },
+    {
+      "confidence" : 0.337,
+      "end_sec" : 60.9375,
+      "label" : "bird_vocalization",
+      "start_sec" : 59.475
+    },
+    {
+      "confidence" : 0.59,
+      "end_sec" : 63.375,
+      "label" : "cricket_chirp",
+      "start_sec" : 60.9375
+    },
+    {
+      "confidence" : 0.538,
+      "end_sec" : 65.32499999999999,
+      "label" : "bird_vocalization",
+      "start_sec" : 63.8625
+    },
+    {
+      "confidence" : 0.326,
+      "end_sec" : 66.3,
+      "label" : "cricket_chirp",
+      "start_sec" : 65.325
+    },
+    {
+      "confidence" : 0.473,
+      "end_sec" : 66.7875,
+      "label" : "bird",
+      "start_sec" : 65.8125
+    },
+    {
+      "confidence" : 0.387,
+      "end_sec" : 67.27499999999999,
+      "label" : "bird_vocalization",
+      "start_sec" : 66.3
+    },
+    {
+      "confidence" : 0.487,
+      "end_sec" : 67.76249999999999,
+      "label" : "bell",
+      "start_sec" : 66.7875
+    },
+    {
+      "confidence" : 0.341,
+      "end_sec" : 70.19999999999999,
+      "label" : "bird",
+      "start_sec" : 69.225
+    },
+    {
+      "confidence" : 0.432,
+      "end_sec" : 70.6875,
+      "label" : "bird_vocalization",
+      "start_sec" : 69.7125
+    },
+    {
+      "confidence" : 0.427,
+      "end_sec" : 73.6125,
+      "label" : "bird_vocalization",
+      "start_sec" : 72.6375
+    },
+    {
+      "confidence" : 0.364,
+      "end_sec" : 75.07499999999999,
+      "label" : "wind",
+      "start_sec" : 73.125
+    },
+    {
+      "confidence" : 0.694,
+      "end_sec" : 75.5625,
+      "label" : "bird_vocalization",
+      "start_sec" : 74.5875
+    },
+    {
+      "confidence" : 0.543,
+      "end_sec" : 76.5375,
+      "label" : "bird",
+      "start_sec" : 75.075
+    },
+    {
+      "confidence" : 0.644,
+      "end_sec" : 77.02499999999999,
+      "label" : "bird_vocalization",
+      "start_sec" : 76.05
+    },
+    {
+      "confidence" : 0.328,
+      "end_sec" : 77.51249999999999,
+      "label" : "cricket_chirp",
+      "start_sec" : 76.5375
+    },
+    {
+      "confidence" : 0.989,
+      "end_sec" : 78.975,
+      "label" : "artillery_fire",
+      "start_sec" : 78
+    },
+    {
+      "confidence" : 0.648,
+      "end_sec" : 79.46249999999999,
+      "label" : "whoosh_swoosh_swish",
+      "start_sec" : 78.4875
+    },
+    {
+      "confidence" : 0.527,
+      "end_sec" : 80.4375,
+      "label" : "ratchet_and_pawl",
+      "start_sec" : 79.4625
+    },
+    {
+      "confidence" : 0.41,
+      "end_sec" : 80.925,
+      "label" : "bird",
+      "start_sec" : 79.95
+    },
+    {
+      "confidence" : 0.869,
+      "end_sec" : 82.875,
+      "label" : "knock",
+      "start_sec" : 80.925
+    },
+    {
+      "confidence" : 0.427,
+      "end_sec" : 83.85,
+      "label" : "bird",
+      "start_sec" : 82.3875
+    },
+    {
+      "confidence" : 0.586,
+      "end_sec" : 84.33749999999999,
+      "label" : "bird_vocalization",
+      "start_sec" : 83.3625
+    },
+    {
+      "confidence" : 0.37,
+      "end_sec" : 84.82499999999999,
+      "label" : "bird",
+      "start_sec" : 83.85
+    },
+    {
+      "confidence" : 0.524,
+      "end_sec" : 87.75,
+      "label" : "wind_chime",
+      "start_sec" : 84.3375
+    },
+    {
+      "confidence" : 0.444,
+      "end_sec" : 88.725,
+      "label" : "bird",
+      "start_sec" : 87.75
+    },
+    {
+      "confidence" : 0.437,
+      "end_sec" : 89.69999999999999,
+      "label" : "wind_rustling_leaves",
+      "start_sec" : 88.725
+    },
+    {
+      "confidence" : 0.467,
+      "end_sec" : 90.675,
+      "label" : "click",
+      "start_sec" : 89.7
+    }
+  ],
+  "source" : "\/Volumes\/new t5 4tb\/field recordings\/field recording brazil\/F241019_001.zprj\/Mic1234.WAV",
+  "summary" : {
+    "median_event_duration_sec" : 0.98,
+    "top_categories" : [
+      {
+        "event_count" : 15,
+        "label" : "wind",
+        "total_seconds" : 23.9
+      },
+      {
+        "event_count" : 14,
+        "label" : "bird_vocalization",
+        "total_seconds" : 16.1
+      },
+      {
+        "event_count" : 12,
+        "label" : "bird",
+        "total_seconds" : 13.2
+      },
+      {
+        "event_count" : 11,
+        "label" : "wind_rustling_leaves",
+        "total_seconds" : 11.7
+      },
+      {
+        "event_count" : 2,
+        "label" : "water",
+        "total_seconds" : 6.3
+      },
+      {
+        "event_count" : 3,
+        "label" : "cricket_chirp",
+        "total_seconds" : 4.4
+      },
+      {
+        "event_count" : 1,
+        "label" : "wind_chime",
+        "total_seconds" : 3.4
+      },
+      {
+        "event_count" : 2,
+        "label" : "speech",
+        "total_seconds" : 2.4
+      },
+      {
+        "event_count" : 1,
+        "label" : "knock",
+        "total_seconds" : 2
+      },
+      {
+        "event_count" : 2,
+        "label" : "bell",
+        "total_seconds" : 1.9
+      },
+      {
+        "event_count" : 1,
+        "label" : "thunder",
+        "total_seconds" : 1
+      },
+      {
+        "event_count" : 1,
+        "label" : "rail_transport",
+        "total_seconds" : 1
+      },
+      {
+        "event_count" : 1,
+        "label" : "chime",
+        "total_seconds" : 1
+      },
+      {
+        "event_count" : 1,
+        "label" : "click",
+        "total_seconds" : 1
+      },
+      {
+        "event_count" : 1,
+        "label" : "artillery_fire",
+        "total_seconds" : 1
+      },
+      {
+        "event_count" : 1,
+        "label" : "ratchet_and_pawl",
+        "total_seconds" : 1
+      },
+      {
+        "event_count" : 1,
+        "label" : "whoosh_swoosh_swish",
+        "total_seconds" : 1
+      }
+    ],
+    "unique_labels" : 17
+  }
+}

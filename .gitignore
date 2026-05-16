@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+DerivedData/
+# track JSON results but not audio files
+results/*.m4a
+results/*.wav
+*.m4a
+*.wav
