@@ -1050,6 +1050,576 @@ func runBulkR2(dryRun: Bool, force: Bool, withSpecies: Bool) async {
     }
 }
 
+// MARK: - R2 listing helpers for events.json
+
+func listAllFieldRecordingEventsJSON() throws -> [(eventsKey: String, bedKey: String, slug: String, prefix: String)] {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: awsPath)
+    p.arguments = ["s3", "ls", "s3://\(r2Bucket)/stems/spatial-mix/field-recording/",
+                   "--recursive",
+                   "--endpoint-url", r2Endpoint,
+                   "--region", r2Region]
+    p.environment = awsEnv()
+    let outPipe = Pipe()
+    p.standardOutput = outPipe
+    p.standardError  = Pipe()
+    try p.run()
+    p.waitUntilExit()
+    let output = (try? outPipe.fileHandleForReading.readToEnd())
+        .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+
+    var results: [(eventsKey: String, bedKey: String, slug: String, prefix: String)] = []
+    for line in output.components(separatedBy: "\n") {
+        let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 4 else { continue }
+        let key = String(parts[3])
+        guard key.hasSuffix("/events.json") else { continue }
+        let prefix = String(key.dropLast("events.json".count))
+        let bedKey = prefix + "bed.m4a"
+        let slug = key.components(separatedBy: "/").dropLast().last ?? key
+        results.append((eventsKey: key, bedKey: bedKey, slug: slug, prefix: prefix))
+    }
+    return results
+}
+
+// MARK: - Species slug sanitization
+
+func speciesSlug(_ commonName: String) -> String {
+    // Lowercase, replace spaces/punctuation with dashes, ASCII only
+    var s = commonName.lowercased()
+    // Transliterate non-ASCII (accented chars) — simple fold
+    s = s.folding(options: .diacriticInsensitive, locale: .init(identifier: "en"))
+    // Replace any non-alphanumeric non-dash with dash
+    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-"))
+    s = s.unicodeScalars
+        .map { allowed.contains($0) ? String($0) : "-" }
+        .joined()
+    // Collapse multiple dashes
+    while s.contains("--") { s = s.replacingOccurrences(of: "--", with: "-") }
+    s = s.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    return s
+}
+
+// MARK: - Clip filename
+
+/// Format confidence as 3-digit integer string (e.g. 0.982 → "098", 1.0 → "100")
+func confTag(_ conf: Double) -> String {
+    let i = Int((conf * 100).rounded())
+    return String(format: "%03d", min(i, 100))
+}
+
+func clipFilename(speciesSlug: String, sourceSlug: String, startSec: Double, confidence: Double) -> String {
+    let startTag = String(format: "%.1f", startSec)
+    let confStr  = confTag(confidence)
+    return "\(speciesSlug)__\(sourceSlug)__t\(startTag)s__c\(confStr).m4a"
+}
+
+// MARK: - Sample cluster (BirdNET events merged for same species within padding window)
+
+struct SampleCluster {
+    let speciesCommon: String
+    let speciesScientific: String
+    let speciesSlug: String
+    let sourceSlug: String
+    let clipStart: Double    // with padding applied, clamped to [0, duration]
+    let clipEnd: Double      // with padding applied, clamped to [0, duration]
+    let eventStart: Double   // raw event start
+    let eventEnd: Double     // raw event end
+    let confidence: Double   // max confidence across merged events
+}
+
+/// Cluster consecutive same-species BirdNET events where any two events whose padded ranges overlap.
+/// Returns clusters sorted by confidence descending, capped at maxPerSpecies.
+func clusterBirdNetEvents(
+    events: [ClassificationEvent],
+    minConf: Double,
+    padding: Double,
+    durationSec: Double,
+    sourceSlug: String,
+    maxPerSpecies: Int
+) -> [SampleCluster] {
+    // Filter to BirdNET events above threshold
+    let filtered = events.filter { $0.source == "birdnet" && $0.confidence >= minConf }
+
+    // Group by species
+    var bySpecies: [String: [ClassificationEvent]] = [:]
+    for e in filtered {
+        let key = e.speciesCommon ?? "unknown"
+        bySpecies[key, default: []].append(e)
+    }
+
+    var clusters: [SampleCluster] = []
+
+    for (_, speciesEvents) in bySpecies {
+        guard let first = speciesEvents.first else { continue }
+        let common     = first.speciesCommon ?? "unknown"
+        let scientific = first.speciesScientific ?? "unknown"
+        let slug       = speciesSlug(common)
+
+        // Sort by start time
+        let sorted = speciesEvents.sorted { $0.startSec < $1.startSec }
+
+        // Cluster: merge events whose padded windows overlap
+        struct RawCluster {
+            var start: Double
+            var end: Double
+            var maxConf: Double
+        }
+        var rawClusters: [RawCluster] = []
+
+        for e in sorted {
+            let paddedStart = max(0, e.startSec - padding)
+            let paddedEnd   = min(durationSec, e.endSec + padding)
+            if let last = rawClusters.last, paddedStart <= last.end {
+                // Overlaps — merge
+                rawClusters[rawClusters.count - 1].end     = max(last.end, paddedEnd)
+                rawClusters[rawClusters.count - 1].maxConf = max(last.maxConf, e.confidence)
+            } else {
+                rawClusters.append(RawCluster(start: paddedStart, end: paddedEnd, maxConf: e.confidence))
+            }
+        }
+
+        // Convert raw clusters to SampleClusters, applying duration filter (>= 1.5s)
+        var speciesClusters: [SampleCluster] = []
+        for rc in rawClusters {
+            let dur = rc.end - rc.start
+            guard dur >= 1.5 else { continue }
+            // Map back to the event range (approximate — use padded window as event range)
+            speciesClusters.append(SampleCluster(
+                speciesCommon:     common,
+                speciesScientific: scientific,
+                speciesSlug:       slug,
+                sourceSlug:        sourceSlug,
+                clipStart:         rc.start,
+                clipEnd:           rc.end,
+                eventStart:        rc.start + padding,
+                eventEnd:          rc.end - padding,
+                confidence:        (rc.maxConf * 1000).rounded() / 1000
+            ))
+        }
+
+        // Sort by confidence desc, cap at maxPerSpecies
+        speciesClusters.sort { $0.confidence > $1.confidence }
+        let capped = Array(speciesClusters.prefix(maxPerSpecies))
+        clusters.append(contentsOf: capped)
+    }
+
+    return clusters
+}
+
+// MARK: - ffmpeg slice to mono m4a
+
+func sliceAudio(bedURL: URL, start: Double, end: Double, outputURL: URL) throws {
+    let ffmpeg = findFFmpeg()
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: ffmpeg)
+    p.arguments = [
+        "-y",
+        "-i",   bedURL.path,
+        "-ss",  String(format: "%.3f", start),
+        "-to",  String(format: "%.3f", end),
+        "-ac",  "1",
+        "-ar",  "48000",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-avoid_negative_ts", "make_zero",
+        outputURL.path
+    ]
+    let errPipe = Pipe()
+    p.standardOutput = Pipe()
+    p.standardError  = errPipe
+    try p.run()
+    p.waitUntilExit()
+    if p.terminationStatus != 0 {
+        let msg = (try? errPipe.fileHandleForReading.readToEnd())
+            .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        throw NSError(domain: "ffmpeg-slice", code: Int(p.terminationStatus),
+                      userInfo: [NSLocalizedDescriptionKey: "ffmpeg slice failed: \(msg)"])
+    }
+}
+
+// MARK: - Upload audio (non-JSON content type)
+
+func uploadAudioToR2(localURL: URL, r2Key: String) throws {
+    let dst = "s3://\(r2Bucket)/\(r2Key)"
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: awsPath)
+    p.arguments = ["s3", "cp", localURL.path, dst,
+                   "--endpoint-url", r2Endpoint,
+                   "--region", r2Region, "--no-progress",
+                   "--content-type", "audio/mp4"]
+    p.environment = awsEnv()
+    let errPipe = Pipe()
+    p.standardOutput = Pipe()
+    p.standardError  = errPipe
+    try p.run()
+    p.waitUntilExit()
+    if p.terminationStatus != 0 {
+        let msg = (try? errPipe.fileHandleForReading.readToEnd())
+            .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        throw NSError(domain: "aws", code: Int(p.terminationStatus),
+                      userInfo: [NSLocalizedDescriptionKey: "aws s3 cp audio upload failed: \(msg)"])
+    }
+}
+
+// MARK: - Sample index builder
+
+struct SampleIndexEntry: Codable {
+    let file: String
+    let sourceSlug: String
+    let startSec: Double
+    let endSec: Double
+    let durationSec: Double
+    let confidence: Double
+
+    enum CodingKeys: String, CodingKey {
+        case file
+        case sourceSlug  = "source_slug"
+        case startSec    = "start_sec"
+        case endSec      = "end_sec"
+        case durationSec = "duration_sec"
+        case confidence
+    }
+}
+
+struct SampleIndexSpecies: Codable {
+    let common: String
+    let scientific: String
+    let slug: String
+    var sampleCount: Int
+    var samples: [SampleIndexEntry]
+
+    enum CodingKeys: String, CodingKey {
+        case common
+        case scientific
+        case slug
+        case sampleCount = "sample_count"
+        case samples
+    }
+}
+
+struct SampleIndex: Codable {
+    let version: Int
+    let generatedAt: String
+    var totalSamples: Int
+    var speciesCount: Int
+    var species: [SampleIndexSpecies]
+
+    enum CodingKeys: String, CodingKey {
+        case version
+        case generatedAt  = "generated_at"
+        case totalSamples = "total_samples"
+        case speciesCount = "species_count"
+        case species
+    }
+}
+
+// MARK: - extract-samples subcommand
+
+func runExtractSamples(
+    allR2: Bool,
+    slugFilter: String?,
+    minConf: Double,
+    padding: Double,
+    maxPerSpecies: Int,
+    dryRun: Bool,
+    force: Bool
+) async {
+    print("=== extract-samples \(dryRun ? "(--dry-run)" : "") ===")
+    print("min-conf=\(minConf), padding=\(padding)s, max-per-species=\(maxPerSpecies)\n")
+
+    // 1. Find all events.json files
+    print("Listing events.json files in R2 …")
+    let allEventsFiles: [(eventsKey: String, bedKey: String, slug: String, prefix: String)]
+    do {
+        allEventsFiles = try listAllFieldRecordingEventsJSON()
+    } catch {
+        fputs("FATAL: cannot list R2 objects: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+
+    var toProcess = allEventsFiles
+    if let sf = slugFilter {
+        toProcess = toProcess.filter { $0.slug == sf }
+        if toProcess.isEmpty {
+            fputs("No events.json found for slug '\(sf)'\n", stderr)
+            exit(1)
+        }
+    }
+
+    print("Found \(toProcess.count) events.json file(s)\n")
+
+    // 2. Load each events.json, collect BirdNET events, cluster
+    struct SlugPlan {
+        let slug: String
+        let bedKey: String
+        let clusters: [SampleCluster]
+        let durationSec: Double
+    }
+    var plans: [SlugPlan] = []
+
+    for ef in toProcess {
+        print("  Loading \(ef.slug)/events.json …")
+        let tmpEvents = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString + "-events.json")
+        defer { try? FileManager.default.removeItem(at: tmpEvents) }
+
+        do {
+            try downloadFromR2(r2Key: ef.eventsKey, to: tmpEvents)
+        } catch {
+            fputs("  ERROR [\(ef.slug)] download events.json: \(error.localizedDescription)\n", stderr)
+            continue
+        }
+
+        let eventsData: Data
+        let eventsResult: [String: Any]
+        do {
+            eventsData = try Data(contentsOf: tmpEvents)
+            guard let parsed = try JSONSerialization.jsonObject(with: eventsData) as? [String: Any] else {
+                fputs("  ERROR [\(ef.slug)] events.json not a JSON object\n", stderr)
+                continue
+            }
+            eventsResult = parsed
+        } catch {
+            fputs("  ERROR [\(ef.slug)] parse events.json: \(error.localizedDescription)\n", stderr)
+            continue
+        }
+
+        let durationSec = eventsResult["duration_sec"] as? Double ?? 0
+        guard let rawEvents = eventsResult["events"] as? [[String: Any]] else {
+            fputs("  ERROR [\(ef.slug)] no events array\n", stderr)
+            continue
+        }
+
+        // Decode BirdNET events
+        var birdnetEvents: [ClassificationEvent] = []
+        for raw in rawEvents {
+            guard let src = raw["source"] as? String, src == "birdnet",
+                  let startSec = raw["start_sec"] as? Double,
+                  let endSec   = raw["end_sec"]   as? Double,
+                  let conf     = raw["confidence"] as? Double,
+                  let common   = raw["species_common"]     as? String,
+                  let sci      = raw["species_scientific"] as? String
+            else { continue }
+            birdnetEvents.append(ClassificationEvent(
+                startSec: startSec, endSec: endSec,
+                speciesCommon: common, speciesScientific: sci,
+                confidence: conf
+            ))
+        }
+
+        let clusters = clusterBirdNetEvents(
+            events: birdnetEvents,
+            minConf: minConf,
+            padding: padding,
+            durationSec: durationSec,
+            sourceSlug: ef.slug,
+            maxPerSpecies: maxPerSpecies
+        )
+
+        let birdnetCount = birdnetEvents.filter { $0.confidence >= minConf }.count
+        print("    \(birdnetCount) BirdNET events (≥\(minConf) conf) → \(clusters.count) clusters after de-dupe + cap")
+        plans.append(SlugPlan(slug: ef.slug, bedKey: ef.bedKey, clusters: clusters, durationSec: durationSec))
+    }
+
+    // 3. Dry-run summary
+    if dryRun {
+        print("\n=== DRY RUN SUMMARY ===")
+
+        // Aggregate by species across all slugs
+        var bySpecies: [String: (common: String, scientific: String, count: Int)] = [:]
+        for plan in plans {
+            for c in plan.clusters {
+                let key = c.speciesSlug
+                if var existing = bySpecies[key] {
+                    existing.count += 1
+                    bySpecies[key] = existing
+                } else {
+                    bySpecies[key] = (common: c.speciesCommon, scientific: c.speciesScientific, count: 1)
+                }
+            }
+        }
+
+        let totalClusters = plans.reduce(0) { $0 + $1.clusters.count }
+        print("Found \(toProcess.count) events.json files in R2")
+        print("Species summary (after clustering, conf ≥ \(minConf)):")
+        let sortedSpecies = bySpecies.sorted { $0.value.count > $1.value.count }
+        for (_, info) in sortedSpecies {
+            print("  \(info.common): \(info.count) sample cluster\(info.count == 1 ? "" : "s")")
+        }
+        print("Total: \(bySpecies.count) species, ~\(totalClusters) sample clips would be uploaded")
+        print("\n[dry-run] No files downloaded or uploaded.")
+        return
+    }
+
+    // 4. Real run: per-slug, download bed, slice, upload
+    var indexSpecies: [String: SampleIndexSpecies] = [:]
+    var totalUploaded = 0
+    var totalSkipped  = 0
+    var totalFailed   = 0
+
+    for (planIdx, plan) in plans.enumerated() {
+        print("\n[\(planIdx+1)/\(plans.count)] \(plan.slug) — \(plan.clusters.count) cluster(s)")
+
+        if plan.clusters.isEmpty {
+            print("  No clusters to extract — skipping bed download")
+            continue
+        }
+
+        // Download bed.m4a to temp
+        let tmpBed = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString + "-bed.m4a")
+        do {
+            try downloadFromR2(r2Key: plan.bedKey, to: tmpBed)
+        } catch {
+            fputs("  ERROR [\(plan.slug)] download bed.m4a: \(error.localizedDescription)\n", stderr)
+            continue
+        }
+        defer { try? FileManager.default.removeItem(at: tmpBed) }
+
+        // Process each cluster
+        for cluster in plan.clusters {
+            let filename = clipFilename(
+                speciesSlug: cluster.speciesSlug,
+                sourceSlug:  cluster.sourceSlug,
+                startSec:    cluster.clipStart,
+                confidence:  cluster.confidence
+            )
+            let r2Key = "samples/birds/\(cluster.speciesSlug)/\(filename)"
+
+            // Idempotency check
+            if !force && r2KeyExists(r2Key) {
+                print("  SKIP  \(filename) (already in R2)")
+                totalSkipped += 1
+
+                // Still add to index even if skipped
+                let entry = SampleIndexEntry(
+                    file:        r2Key,
+                    sourceSlug:  cluster.sourceSlug,
+                    startSec:    (cluster.clipStart * 10).rounded() / 10,
+                    endSec:      (cluster.clipEnd * 10).rounded() / 10,
+                    durationSec: ((cluster.clipEnd - cluster.clipStart) * 10).rounded() / 10,
+                    confidence:  cluster.confidence
+                )
+                addToIndex(entry: entry, cluster: cluster, index: &indexSpecies)
+                continue
+            }
+
+            // Slice with ffmpeg
+            let tmpClip = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent(UUID().uuidString + "-clip.m4a")
+            do {
+                try sliceAudio(bedURL: tmpBed, start: cluster.clipStart, end: cluster.clipEnd, outputURL: tmpClip)
+            } catch {
+                fputs("  ERROR slice \(filename): \(error.localizedDescription)\n", stderr)
+                totalFailed += 1
+                continue
+            }
+            defer { try? FileManager.default.removeItem(at: tmpClip) }
+
+            // Get actual file size for reporting
+            let clipSize = (try? FileManager.default.attributesOfItem(atPath: tmpClip.path)[.size] as? Int) ?? 0
+
+            // Upload to R2
+            do {
+                try uploadAudioToR2(localURL: tmpClip, r2Key: r2Key)
+            } catch {
+                fputs("  ERROR upload \(filename): \(error.localizedDescription)\n", stderr)
+                totalFailed += 1
+                continue
+            }
+
+            let sizeKB = clipSize / 1024
+            let durationFmt = String(format: "%.1f", cluster.clipEnd - cluster.clipStart)
+            print("  UPLOADED  \(filename)  (\(durationFmt)s, \(sizeKB)KB)")
+            totalUploaded += 1
+
+            let entry = SampleIndexEntry(
+                file:        r2Key,
+                sourceSlug:  cluster.sourceSlug,
+                startSec:    (cluster.clipStart * 10).rounded() / 10,
+                endSec:      (cluster.clipEnd * 10).rounded() / 10,
+                durationSec: ((cluster.clipEnd - cluster.clipStart) * 10).rounded() / 10,
+                confidence:  cluster.confidence
+            )
+            addToIndex(entry: entry, cluster: cluster, index: &indexSpecies)
+        }
+    }
+
+    // 5. Build and upload samples/index.json
+    let totalSamples = indexSpecies.values.reduce(0) { $0 + $1.sampleCount }
+    var speciesList = Array(indexSpecies.values)
+    // Sort each species's samples by confidence desc
+    for i in 0..<speciesList.count {
+        speciesList[i].samples.sort { $0.confidence > $1.confidence }
+    }
+    // Sort species by sample count desc
+    speciesList.sort { $0.sampleCount > $1.sampleCount }
+
+    let index = SampleIndex(
+        version:      1,
+        generatedAt:  iso8601Now(),
+        totalSamples: totalSamples,
+        speciesCount: speciesList.count,
+        species:      speciesList
+    )
+
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let indexData: Data
+    do {
+        indexData = try encoder.encode(index)
+    } catch {
+        fputs("ERROR encoding samples/index.json: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+
+    let tmpIndex = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("samples-index-\(UUID().uuidString).json")
+    do {
+        try indexData.write(to: tmpIndex)
+        try uploadToR2(localURL: tmpIndex, r2Key: "samples/index.json")
+        try? FileManager.default.removeItem(at: tmpIndex)
+        print("\nUploaded samples/index.json (\(indexData.count / 1024) KB)")
+    } catch {
+        fputs("ERROR uploading samples/index.json: \(error.localizedDescription)\n", stderr)
+    }
+
+    // 6. Final summary
+    print("\n=== extract-samples complete ===")
+    print("Uploaded: \(totalUploaded) new clips")
+    print("Skipped:  \(totalSkipped) (already in R2)")
+    print("Failed:   \(totalFailed)")
+    print("Species:  \(speciesList.count)")
+    print("Total in index: \(totalSamples) samples")
+    print("\nTop 5 species by sample count:")
+    for s in speciesList.prefix(5) {
+        print("  \(s.common): \(s.sampleCount)")
+    }
+    if let first = speciesList.first, let firstSample = first.samples.first {
+        print("\nSample R2 path: \(firstSample.file)")
+    }
+}
+
+/// Helper to add an entry to the in-memory species index.
+func addToIndex(entry: SampleIndexEntry, cluster: SampleCluster,
+                index: inout [String: SampleIndexSpecies]) {
+    let key = cluster.speciesSlug
+    if var existing = index[key] {
+        existing.samples.append(entry)
+        existing.sampleCount = existing.samples.count
+        index[key] = existing
+    } else {
+        index[key] = SampleIndexSpecies(
+            common:      cluster.speciesCommon,
+            scientific:  cluster.speciesScientific,
+            slug:        cluster.speciesSlug,
+            sampleCount: 1,
+            samples:     [entry]
+        )
+    }
+}
+
 // MARK: - Argument parsing & dispatch
 
 let args = CommandLine.arguments.dropFirst()
@@ -1059,11 +1629,48 @@ enum Mode {
     case r2Prefix(String)
     case allFieldRecordings
     case bulkR2(dryRun: Bool, force: Bool, withSpecies: Bool)
+    case extractSamples(allR2: Bool, slugFilter: String?, minConf: Double,
+                        padding: Double, maxPerSpecies: Int, dryRun: Bool, force: Bool)
 }
 
 func parseMode() -> Mode? {
     let argList = Array(args)
     guard !argList.isEmpty else { return nil }
+
+    if argList[0] == "extract-samples" {
+        let allR2   = argList.contains("--all-r2")
+        let dryRun  = argList.contains("--dry-run")
+        let force   = argList.contains("--force")
+
+        var slugFilter: String? = nil
+        if let idx = argList.firstIndex(of: "--slug"), idx + 1 < argList.count {
+            slugFilter = argList[idx + 1]
+        }
+
+        var minConf: Double = 0.5
+        if let idx = argList.firstIndex(of: "--min-conf"), idx + 1 < argList.count {
+            minConf = Double(argList[idx + 1]) ?? 0.5
+        }
+
+        var padding: Double = 3.0
+        if let idx = argList.firstIndex(of: "--padding"), idx + 1 < argList.count {
+            padding = Double(argList[idx + 1]) ?? 3.0
+        }
+
+        var maxPerSpecies: Int = 30
+        if let idx = argList.firstIndex(of: "--max-per-species"), idx + 1 < argList.count {
+            maxPerSpecies = Int(argList[idx + 1]) ?? 30
+        }
+
+        guard allR2 || slugFilter != nil else {
+            fputs("extract-samples requires --all-r2 or --slug <slug>\n", stderr)
+            exit(1)
+        }
+
+        return .extractSamples(allR2: allR2, slugFilter: slugFilter, minConf: minConf,
+                                padding: padding, maxPerSpecies: maxPerSpecies,
+                                dryRun: dryRun, force: force)
+    }
 
     if argList[0] == "bulk-r2" {
         let dryRun     = argList.contains("--dry-run")
@@ -1095,6 +1702,9 @@ guard let mode = parseMode() else {
       analyze-bed --r2-prefix <prefix>                                      # same
       analyze-bed --all-field-recordings                                    # process everything in R2 (local output only)
       analyze-bed bulk-r2 [--dry-run] [--force] [--with-species]           # bulk: analyze R2, upload events.json + catalog
+      analyze-bed extract-samples --all-r2 [--dry-run] [--force]           # extract per-species sample library
+                  [--slug <slug>] [--min-conf 0.5] [--padding 3.0]
+                  [--max-per-species 30]
 
     Species pass (--with-species) uses:
       - BirdNET overlap=0.5 (1.5 s step, catches briefly-calling species)
@@ -1103,6 +1713,14 @@ guard let mode = parseMode() else {
         Bands overlap intentionally. Per-band temp wavs are deleted after analysis.
     """)
     exit(1)
+}
+
+if case .extractSamples(let allR2, let slugFilter, let minConf, let padding,
+                         let maxPerSpecies, let dryRun, let force) = mode {
+    await runExtractSamples(allR2: allR2, slugFilter: slugFilter, minConf: minConf,
+                             padding: padding, maxPerSpecies: maxPerSpecies,
+                             dryRun: dryRun, force: force)
+    exit(0)
 }
 
 if case .bulkR2(let dryRun, let force, let withSpecies) = mode {
@@ -1151,6 +1769,9 @@ case .allFieldRecordings:
 
 case .bulkR2:
     break
+
+case .extractSamples:
+    break  // handled above
 }
 
 // Run all jobs (local paths — no species pass in legacy mode)
