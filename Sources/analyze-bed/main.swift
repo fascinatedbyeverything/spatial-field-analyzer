@@ -1620,6 +1620,624 @@ func addToIndex(entry: SampleIndexEntry, cluster: SampleCluster,
     }
 }
 
+// MARK: - Timeline models
+
+struct TimelineEvent: Codable {
+    let timeSec: Double
+    let timeDisplay: String
+    let kind: String           // "category" | "species"
+    let label: String          // category label or species common name
+    let scientific: String?    // only for species
+    let durationSec: Double
+    let confidence: Double
+    let source: String
+
+    enum CodingKeys: String, CodingKey {
+        case timeSec      = "time_sec"
+        case timeDisplay  = "time_display"
+        case kind
+        case label
+        case scientific
+        case durationSec  = "duration_sec"
+        case confidence
+        case source
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(timeSec, forKey: .timeSec)
+        try c.encode(timeDisplay, forKey: .timeDisplay)
+        try c.encode(kind, forKey: .kind)
+        try c.encode(label, forKey: .label)
+        if let sci = scientific { try c.encode(sci, forKey: .scientific) }
+        try c.encode(durationSec, forKey: .durationSec)
+        try c.encode(confidence, forKey: .confidence)
+        try c.encode(source, forKey: .source)
+    }
+}
+
+struct TimelineScene: Codable {
+    let startSec: Double
+    let endSec: Double
+    let label: String
+    let dominantCategories: [String]
+    let speciesInScene: [String]
+    let eventCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case startSec           = "start_sec"
+        case endSec             = "end_sec"
+        case label
+        case dominantCategories = "dominant_categories"
+        case speciesInScene     = "species_in_scene"
+        case eventCount         = "event_count"
+    }
+}
+
+struct TimelineJSON: Codable {
+    let sourceSlug: String
+    let durationSec: Double
+    let generatedAt: String
+    let scenes: [TimelineScene]
+    let events: [TimelineEvent]
+
+    enum CodingKeys: String, CodingKey {
+        case sourceSlug  = "source_slug"
+        case durationSec = "duration_sec"
+        case generatedAt = "generated_at"
+        case scenes
+        case events
+    }
+}
+
+// MARK: - Time display formatting
+
+/// Format seconds to mm:ss or hh:mm:ss based on total duration.
+func formatTime(_ sec: Double, totalDuration: Double) -> String {
+    let totalInt = Int(sec)
+    let h = totalInt / 3600
+    let m = (totalInt % 3600) / 60
+    let s = totalInt % 60
+    if totalDuration >= 3600 {
+        return String(format: "%02d:%02d:%02d", h, m, s)
+    } else {
+        return String(format: "%02d:%02d", m, s)
+    }
+}
+
+// MARK: - Scene detection
+
+private let appleMinConfForTimeline: Double = 0.4
+private let sceneWindowSec: Double = 30.0
+
+/// Build scenes from Apple SoundAnalysis events using 30s bucket windowing.
+func buildScenes(
+    appleEvents: [ClassificationEvent],
+    birdnetEvents: [ClassificationEvent],
+    durationSec: Double
+) -> [TimelineScene] {
+    guard durationSec > 0 else { return [] }
+
+    let numBuckets = Int(ceil(durationSec / sceneWindowSec))
+
+    // Per-bucket: label → total seconds
+    var bucketDominant: [String] = []
+    var bucketEventCount: [Int] = []
+
+    for b in 0..<numBuckets {
+        let bucketStart = Double(b) * sceneWindowSec
+        let bucketEnd   = min(Double(b + 1) * sceneWindowSec, durationSec)
+
+        var labelSecs: [String: Double] = [:]
+        var evCount = 0
+        for e in appleEvents {
+            // Overlap with bucket
+            let overlap = min(e.endSec, bucketEnd) - max(e.startSec, bucketStart)
+            guard overlap > 0 else { continue }
+            labelSecs[e.label, default: 0] += overlap
+            evCount += 1
+        }
+        let dominant = labelSecs.max(by: { $0.value < $1.value })?.key ?? "ambient"
+        bucketDominant.append(dominant)
+        bucketEventCount.append(evCount)
+    }
+
+    // Merge consecutive buckets with the same dominant category
+    struct RawScene { var startBucket: Int; var endBucket: Int; var dominant: String }
+    var rawScenes: [RawScene] = []
+    guard !bucketDominant.isEmpty else { return [] }
+
+    var cur = RawScene(startBucket: 0, endBucket: 0, dominant: bucketDominant[0])
+    for b in 1..<numBuckets {
+        if bucketDominant[b] == cur.dominant {
+            cur.endBucket = b
+        } else {
+            rawScenes.append(cur)
+            cur = RawScene(startBucket: b, endBucket: b, dominant: bucketDominant[b])
+        }
+    }
+    rawScenes.append(cur)
+
+    // Convert raw scenes into TimelineScene
+    var scenes: [TimelineScene] = []
+    for rs in rawScenes {
+        let startSec = Double(rs.startBucket) * sceneWindowSec
+        let endSec   = min(Double(rs.endBucket + 1) * sceneWindowSec, durationSec)
+
+        // Count events in scene range (Apple)
+        let eventsInScene = appleEvents.filter { $0.startSec < endSec && $0.endSec > startSec }
+        let birdnetInScene = birdnetEvents.filter { $0.startSec < endSec && $0.endSec > startSec }
+        let totalEvCount = eventsInScene.count + birdnetInScene.count
+
+        // Top categories in scene by total seconds
+        var labelSecs: [String: Double] = [:]
+        for e in eventsInScene {
+            let overlap = min(e.endSec, endSec) - max(e.startSec, startSec)
+            labelSecs[e.label, default: 0] += max(0, overlap)
+        }
+        let topCategories = labelSecs.sorted { $0.value > $1.value }
+            .prefix(3).map(\.key)
+
+        // Species in scene with confidence >= 0.5
+        var speciesSeen: [String] = []
+        var seenSet: Set<String> = []
+        for e in birdnetInScene.sorted(by: { ($0.confidence) > ($1.confidence) }) {
+            guard let common = e.speciesCommon, e.confidence >= 0.5 else { continue }
+            if !seenSet.contains(common) {
+                speciesSeen.append(common)
+                seenSet.insert(common)
+            }
+        }
+
+        // Scene label heuristic
+        let sceneDuration = endSec - startSec
+        var windWaterSec = labelSecs["wind"] ?? 0
+        windWaterSec += labelSecs["rain"] ?? 0
+        windWaterSec += labelSecs["water"] ?? 0
+        windWaterSec += labelSecs["wind_noise_microphone"] ?? 0
+        windWaterSec += labelSecs["wind_rustling_leaves"] ?? 0
+        let totalLabeledSec = labelSecs.values.reduce(0, +)
+        let uniqueSpeciesCount = seenSet.count
+
+        let sceneEventsPerSec = sceneDuration > 0 ? Double(eventsInScene.count) / sceneDuration : 0
+        let sceneLabel: String
+        if totalLabeledSec > 0 && windWaterSec / totalLabeledSec > 0.6 {
+            let dom = rs.dominant.replacingOccurrences(of: "_", with: " ")
+            sceneLabel = "\(dom.prefix(1).uppercased() + dom.dropFirst()) dominated"
+        } else if uniqueSpeciesCount >= 3 {
+            sceneLabel = "Active chorus"
+        } else if sceneEventsPerSec < 5.0 / 30.0 {
+            // Fewer than ~5 events in 30s window
+            sceneLabel = "Quiet ambient"
+        } else {
+            let dom = rs.dominant.replacingOccurrences(of: "_", with: " ")
+            sceneLabel = dom.prefix(1).uppercased() + dom.dropFirst()
+        }
+
+        scenes.append(TimelineScene(
+            startSec: (startSec * 10).rounded() / 10,
+            endSec:   (endSec   * 10).rounded() / 10,
+            label:    sceneLabel,
+            dominantCategories: Array(topCategories),
+            speciesInScene: speciesSeen,
+            eventCount: totalEvCount
+        ))
+    }
+    return scenes
+}
+
+// MARK: - Timeline event builder
+
+/// De-duplicate consecutive same-label Apple events within 2s gap, cluster them.
+func clusterAppleForTimeline(_ events: [ClassificationEvent]) -> [ClassificationEvent] {
+    let sorted = events.sorted { $0.startSec < $1.startSec }
+    var out: [ClassificationEvent] = []
+    var i = 0
+    while i < sorted.count {
+        let base = sorted[i]
+        var mergedEnd = base.endSec
+        var confs = [base.confidence]
+        var j = i + 1
+        while j < sorted.count {
+            let next = sorted[j]
+            if next.label == base.label && next.startSec - mergedEnd <= 2.0 {
+                mergedEnd = max(mergedEnd, next.endSec)
+                confs.append(next.confidence)
+                j += 1
+            } else {
+                break
+            }
+        }
+        let meanConf = (confs.reduce(0, +) / Double(confs.count) * 1000).rounded() / 1000
+        out.append(ClassificationEvent(startSec: base.startSec, endSec: mergedEnd,
+                                       label: base.label, confidence: meanConf))
+        i = j
+    }
+    return out
+}
+
+func buildTimelineEvents(
+    appleEvents: [ClassificationEvent],
+    birdnetEvents: [ClassificationEvent],
+    durationSec: Double
+) -> [TimelineEvent] {
+    // Filter Apple: confidence >= 0.4, then de-duplicate consecutive same-label within 2s
+    let filteredApple = appleEvents.filter { $0.confidence >= appleMinConfForTimeline }
+    let clusteredApple = clusterAppleForTimeline(filteredApple)
+
+    var events: [TimelineEvent] = []
+
+    for e in clusteredApple {
+        events.append(TimelineEvent(
+            timeSec:     (e.startSec * 10).rounded() / 10,
+            timeDisplay: formatTime(e.startSec, totalDuration: durationSec),
+            kind:        "category",
+            label:       e.label,
+            scientific:  nil,
+            durationSec: ((e.endSec - e.startSec) * 10).rounded() / 10,
+            confidence:  e.confidence,
+            source:      "apple-soundanalysis"
+        ))
+    }
+
+    // All BirdNET events (already filtered upstream)
+    for e in birdnetEvents {
+        events.append(TimelineEvent(
+            timeSec:     (e.startSec * 10).rounded() / 10,
+            timeDisplay: formatTime(e.startSec, totalDuration: durationSec),
+            kind:        "species",
+            label:       e.speciesCommon ?? "unknown",
+            scientific:  e.speciesScientific,
+            durationSec: ((e.endSec - e.startSec) * 10).rounded() / 10,
+            confidence:  e.confidence,
+            source:      "birdnet"
+        ))
+    }
+
+    return events.sorted { $0.timeSec < $1.timeSec }
+}
+
+// MARK: - Markdown generator
+
+func buildTimelineMarkdown(
+    slug: String,
+    durationSec: Double,
+    analyzerVersion: String,
+    scenes: [TimelineScene],
+    allEvents: [TimelineEvent]
+) -> String {
+    var md = ""
+    let totalDur = durationSec
+
+    // Header
+    md += "# \(slug) — Timeline\n\n"
+
+    // Duration line
+    let durDisplay = formatTime(durationSec, totalDuration: totalDur)
+    md += "**Duration:** \(durDisplay) (\(Int(durationSec))s)\n"
+    md += "**Analyzed:** \(iso8601Now().prefix(10))\n"
+    md += "**Engines:** \(analyzerVersion)\n\n"
+
+    // Summary
+    md += "## Summary\n\n"
+
+    // Dominant categories from all Apple events
+    var catSecs: [String: Double] = [:]
+    for e in allEvents where e.kind == "category" {
+        catSecs[e.label, default: 0] += e.durationSec
+    }
+    let topCats = catSecs.sorted { $0.value > $1.value }.prefix(8).map(\.key)
+    md += "- **Dominant categories:** \(topCats.joined(separator: ", "))\n"
+
+    // Species with confidence >= 0.5 for summary
+    var speciesSummaryMap: [String: Double] = [:]
+    for e in allEvents where e.kind == "species" && e.confidence >= 0.5 {
+        speciesSummaryMap[e.label, default: 0] = max(speciesSummaryMap[e.label, default: 0], e.confidence)
+    }
+    let topSpecies = speciesSummaryMap.sorted { $0.value > $1.value }.map(\.key)
+    let speciesCount = allEvents.filter { $0.kind == "species" }
+        .map(\.label).reduce(into: Set<String>()) { $0.insert($1) }.count
+
+    if !topSpecies.isEmpty {
+        let speciesLine = topSpecies.count <= 8
+            ? topSpecies.joined(separator: ", ")
+            : topSpecies.prefix(8).joined(separator: ", ") + ", ... (\(topSpecies.count) total)"
+        md += "- **Species detected (\(speciesCount)):** \(speciesLine)\n"
+    }
+
+    let totalEvents = allEvents.count
+    let speciesEvCount = allEvents.filter { $0.kind == "species" }.count
+    let catEvCount = allEvents.filter { $0.kind == "category" }.count
+    md += "- **Total events:** \(totalEvents) (\(speciesEvCount) species, \(catEvCount) category)\n\n"
+
+    // Scenes
+    md += "## Scenes\n\n"
+
+    for scene in scenes {
+        let sceneStart = formatTime(scene.startSec, totalDuration: totalDur)
+        let sceneEnd   = formatTime(scene.endSec,   totalDuration: totalDur)
+        md += "### \(sceneStart) – \(sceneEnd) — \(scene.label)\n"
+        if !scene.dominantCategories.isEmpty {
+            md += "*\(scene.dominantCategories.joined(separator: ", "))*\n\n"
+        }
+
+        // Events in this scene's time range
+        let sceneEvents = allEvents.filter {
+            $0.timeSec >= scene.startSec && $0.timeSec < scene.endSec
+        }
+
+        if sceneEvents.isEmpty {
+            md += "*(no events)*\n\n"
+        } else {
+            // Group overlapping species events at same timestamp into combined lines
+            var i = 0
+            while i < sceneEvents.count {
+                let e = sceneEvents[i]
+                let ts = e.timeDisplay
+
+                // Gather all events within 0.5s of this one for overlap detection
+                var simultaneous = [e]
+                var j = i + 1
+                while j < sceneEvents.count && abs(sceneEvents[j].timeSec - e.timeSec) <= 0.5 {
+                    simultaneous.append(sceneEvents[j])
+                    j += 1
+                }
+
+                // Build the line
+                let speciesGroup = simultaneous.filter { $0.kind == "species" }
+                let catGroup     = simultaneous.filter { $0.kind == "category" }
+
+                if speciesGroup.count > 1 && catGroup.isEmpty {
+                    // Multiple species at same time
+                    let names = speciesGroup.map { "\($0.label) (conf \(String(format: "%.2f", $0.confidence)))" }
+                    md += "- **\(ts)** \(names.joined(separator: " + ")) (overlapping)\n"
+                } else {
+                    for ev in simultaneous {
+                        let confStr = String(format: "%.2f", ev.confidence)
+                        if ev.kind == "species" {
+                            let durNote = ev.durationSec >= 5 ? " — sustained, \(Int(ev.durationSec))s" : ""
+                            md += "- **\(ts)** \(ev.label) (conf \(confStr))\(durNote)\n"
+                        } else {
+                            let durNote = ev.durationSec >= 3 ? " (\(Int(ev.durationSec))s, conf \(confStr))" :
+                                                                " (conf \(confStr))"
+                            md += "- **\(ts)** \(ev.label)\(durNote)\n"
+                        }
+                    }
+                }
+                i = j
+            }
+            md += "\n"
+        }
+    }
+
+    return md
+}
+
+// MARK: - Upload text (markdown content type)
+
+func uploadTextToR2(localURL: URL, r2Key: String, contentType: String) throws {
+    let dst = "s3://\(r2Bucket)/\(r2Key)"
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: awsPath)
+    p.arguments = ["s3", "cp", localURL.path, dst,
+                   "--endpoint-url", r2Endpoint,
+                   "--region", r2Region, "--no-progress",
+                   "--content-type", contentType]
+    p.environment = awsEnv()
+    let errPipe = Pipe()
+    p.standardOutput = Pipe()
+    p.standardError  = errPipe
+    try p.run()
+    p.waitUntilExit()
+    if p.terminationStatus != 0 {
+        let msg = (try? errPipe.fileHandleForReading.readToEnd())
+            .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        throw NSError(domain: "aws", code: Int(p.terminationStatus),
+                      userInfo: [NSLocalizedDescriptionKey: "aws s3 cp text upload failed: \(msg)"])
+    }
+}
+
+// MARK: - generate-timelines subcommand
+
+func runGenerateTimelines(
+    allR2: Bool,
+    slugFilter: String?,
+    formats: Set<String>,
+    dryRun: Bool,
+    force: Bool
+) {
+    print("=== generate-timelines \(dryRun ? "(--dry-run)" : "") ===\n")
+
+    // 1. Find all events.json files
+    print("Listing events.json files in R2 …")
+    let allEventsFiles: [(eventsKey: String, bedKey: String, slug: String, prefix: String)]
+    do {
+        allEventsFiles = try listAllFieldRecordingEventsJSON()
+    } catch {
+        fputs("FATAL: cannot list R2 objects: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+
+    var toProcess = allEventsFiles
+    if let sf = slugFilter {
+        toProcess = toProcess.filter { $0.slug == sf }
+        if toProcess.isEmpty {
+            fputs("No events.json found for slug '\(sf)'\n", stderr)
+            exit(1)
+        }
+    }
+    print("Found \(toProcess.count) events.json file(s)\n")
+
+    // 2. Idempotency check — skip slugs that already have timeline.json unless --force
+    var toGenerate: [(eventsKey: String, bedKey: String, slug: String, prefix: String)] = []
+    var skipped: [String] = []
+
+    for ef in toProcess {
+        let timelineKey = ef.prefix + "timeline.json"
+        if !force && r2KeyExists(timelineKey) {
+            skipped.append(ef.slug)
+            print("  SKIP  \(ef.slug)  (timeline.json already in R2)")
+        } else {
+            toGenerate.append(ef)
+        }
+    }
+
+    print("\n\(toGenerate.count) to generate, \(skipped.count) already done.")
+
+    if dryRun {
+        print("\n[dry-run] Would process:")
+        for (i, ef) in toGenerate.enumerated() {
+            print("  [\(i+1)/\(toGenerate.count)] \(ef.slug)")
+            print("           events.json → \(ef.eventsKey)")
+            print("           timeline.json → \(ef.prefix)timeline.json")
+            print("           timeline.md   → \(ef.prefix)timeline.md")
+        }
+        print("\n[dry-run] No files downloaded or uploaded.")
+        return
+    }
+
+    var totalMD = 0
+    var totalJSON = 0
+    var failed = 0
+
+    for (i, ef) in toGenerate.enumerated() {
+        print("\n[\(i+1)/\(toGenerate.count)] \(ef.slug)")
+
+        // Download events.json
+        let tmpEvents = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString + "-events.json")
+        defer { try? FileManager.default.removeItem(at: tmpEvents) }
+
+        do {
+            try downloadFromR2(r2Key: ef.eventsKey, to: tmpEvents)
+        } catch {
+            fputs("  ERROR [\(ef.slug)] download events.json: \(error.localizedDescription)\n", stderr)
+            failed += 1
+            continue
+        }
+
+        // Parse
+        let rawData: Data
+        let rawDict: [String: Any]
+        do {
+            rawData = try Data(contentsOf: tmpEvents)
+            guard let parsed = try JSONSerialization.jsonObject(with: rawData) as? [String: Any] else {
+                fputs("  ERROR [\(ef.slug)] events.json not a JSON object\n", stderr)
+                failed += 1
+                continue
+            }
+            rawDict = parsed
+        } catch {
+            fputs("  ERROR [\(ef.slug)] parse events.json: \(error.localizedDescription)\n", stderr)
+            failed += 1
+            continue
+        }
+
+        let durationSec = rawDict["duration_sec"] as? Double ?? 0
+        let analyzerVersion = rawDict["analyzer_version"] as? String ?? "unknown"
+        guard let rawEvents = rawDict["events"] as? [[String: Any]] else {
+            fputs("  ERROR [\(ef.slug)] no events array\n", stderr)
+            failed += 1
+            continue
+        }
+
+        // Decode events
+        var appleEvents: [ClassificationEvent] = []
+        var birdnetEvents: [ClassificationEvent] = []
+        for raw in rawEvents {
+            guard let startSec = raw["start_sec"] as? Double,
+                  let endSec   = raw["end_sec"]   as? Double,
+                  let conf     = raw["confidence"] as? Double else { continue }
+
+            if let src = raw["source"] as? String, src == "birdnet" {
+                let common = raw["species_common"]     as? String ?? "unknown"
+                let sci    = raw["species_scientific"] as? String ?? "unknown"
+                birdnetEvents.append(ClassificationEvent(
+                    startSec: startSec, endSec: endSec,
+                    speciesCommon: common, speciesScientific: sci,
+                    confidence: conf
+                ))
+            } else if let label = raw["label"] as? String {
+                appleEvents.append(ClassificationEvent(
+                    startSec: startSec, endSec: endSec,
+                    label: label, confidence: conf
+                ))
+            }
+        }
+
+        print("  Parsed \(appleEvents.count) Apple events + \(birdnetEvents.count) BirdNET events")
+
+        // Build timeline
+        let scenes = buildScenes(appleEvents: appleEvents, birdnetEvents: birdnetEvents,
+                                 durationSec: durationSec)
+        let timelineEvents = buildTimelineEvents(appleEvents: appleEvents,
+                                                 birdnetEvents: birdnetEvents,
+                                                 durationSec: durationSec)
+
+        print("  Built \(scenes.count) scenes, \(timelineEvents.count) timeline events")
+
+        // Generate timeline.json
+        if formats.contains("json") {
+            let timelineJSON = TimelineJSON(
+                sourceSlug:  ef.slug,
+                durationSec: (durationSec * 10).rounded() / 10,
+                generatedAt: iso8601Now(),
+                scenes:      scenes,
+                events:      timelineEvents
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            do {
+                let jsonData = try encoder.encode(timelineJSON)
+                let tmpJSON  = URL(fileURLWithPath: NSTemporaryDirectory())
+                    .appendingPathComponent(UUID().uuidString + "-timeline.json")
+                try jsonData.write(to: tmpJSON)
+                defer { try? FileManager.default.removeItem(at: tmpJSON) }
+                let r2Key = ef.prefix + "timeline.json"
+                try uploadToR2(localURL: tmpJSON, r2Key: r2Key)
+                print("  → uploaded timeline.json (\(jsonData.count / 1024) KB)")
+                totalJSON += 1
+            } catch {
+                fputs("  ERROR [\(ef.slug)] timeline.json upload: \(error.localizedDescription)\n", stderr)
+                failed += 1
+            }
+        }
+
+        // Generate timeline.md
+        if formats.contains("md") {
+            let mdText = buildTimelineMarkdown(
+                slug:            ef.slug,
+                durationSec:     durationSec,
+                analyzerVersion: analyzerVersion,
+                scenes:          scenes,
+                allEvents:       timelineEvents
+            )
+            do {
+                let mdData = mdText.data(using: .utf8) ?? Data()
+                let tmpMD  = URL(fileURLWithPath: NSTemporaryDirectory())
+                    .appendingPathComponent(UUID().uuidString + "-timeline.md")
+                try mdData.write(to: tmpMD)
+                defer { try? FileManager.default.removeItem(at: tmpMD) }
+                let r2Key = ef.prefix + "timeline.md"
+                try uploadTextToR2(localURL: tmpMD, r2Key: r2Key, contentType: "text/markdown")
+                print("  → uploaded timeline.md (\(mdData.count / 1024) KB)")
+                totalMD += 1
+            } catch {
+                fputs("  ERROR [\(ef.slug)] timeline.md upload: \(error.localizedDescription)\n", stderr)
+                failed += 1
+            }
+        }
+    }
+
+    print("\n=== generate-timelines complete ===")
+    print("Processed: \(toGenerate.count - failed)/\(toGenerate.count) slugs")
+    print("timeline.json files uploaded: \(totalJSON)")
+    print("timeline.md files uploaded:   \(totalMD)")
+    if failed > 0 {
+        print("Failures: \(failed)")
+    }
+}
+
 // MARK: - Argument parsing & dispatch
 
 let args = CommandLine.arguments.dropFirst()
@@ -1631,11 +2249,37 @@ enum Mode {
     case bulkR2(dryRun: Bool, force: Bool, withSpecies: Bool)
     case extractSamples(allR2: Bool, slugFilter: String?, minConf: Double,
                         padding: Double, maxPerSpecies: Int, dryRun: Bool, force: Bool)
+    case generateTimelines(allR2: Bool, slugFilter: String?, formats: Set<String>,
+                           dryRun: Bool, force: Bool)
 }
 
 func parseMode() -> Mode? {
     let argList = Array(args)
     guard !argList.isEmpty else { return nil }
+
+    if argList[0] == "generate-timelines" {
+        let allR2  = argList.contains("--all-r2")
+        let dryRun = argList.contains("--dry-run")
+        let force  = argList.contains("--force")
+
+        var slugFilter: String? = nil
+        if let idx = argList.firstIndex(of: "--slug"), idx + 1 < argList.count {
+            slugFilter = argList[idx + 1]
+        }
+
+        var formats: Set<String> = ["md", "json"]
+        if let idx = argList.firstIndex(of: "--formats"), idx + 1 < argList.count {
+            formats = Set(argList[idx + 1].components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) })
+        }
+
+        guard allR2 || slugFilter != nil else {
+            fputs("generate-timelines requires --all-r2 or --slug <slug>\n", stderr)
+            exit(1)
+        }
+
+        return .generateTimelines(allR2: allR2, slugFilter: slugFilter,
+                                  formats: formats, dryRun: dryRun, force: force)
+    }
 
     if argList[0] == "extract-samples" {
         let allR2   = argList.contains("--all-r2")
@@ -1705,6 +2349,8 @@ guard let mode = parseMode() else {
       analyze-bed extract-samples --all-r2 [--dry-run] [--force]           # extract per-species sample library
                   [--slug <slug>] [--min-conf 0.5] [--padding 3.0]
                   [--max-per-species 30]
+      analyze-bed generate-timelines --all-r2 [--dry-run] [--force]        # generate timeline.json + timeline.md per slug
+                  [--slug <slug>] [--formats md,json]
 
     Species pass (--with-species) uses:
       - BirdNET overlap=0.5 (1.5 s step, catches briefly-calling species)
@@ -1713,6 +2359,12 @@ guard let mode = parseMode() else {
         Bands overlap intentionally. Per-band temp wavs are deleted after analysis.
     """)
     exit(1)
+}
+
+if case .generateTimelines(let allR2, let slugFilter, let formats, let dryRun, let force) = mode {
+    runGenerateTimelines(allR2: allR2, slugFilter: slugFilter,
+                         formats: formats, dryRun: dryRun, force: force)
+    exit(0)
 }
 
 if case .extractSamples(let allR2, let slugFilter, let minConf, let padding,
@@ -1771,6 +2423,9 @@ case .bulkR2:
     break
 
 case .extractSamples:
+    break  // handled above
+
+case .generateTimelines:
     break  // handled above
 }
 
