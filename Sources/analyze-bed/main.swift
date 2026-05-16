@@ -13,6 +13,8 @@ private var r2Endpoint: String { "https://\(r2AccountId).r2.cloudflarestorage.co
 
 private let awsPath = "/opt/homebrew/bin/aws"
 
+private let confoundsNote = "rail_transport and elk_bugle are known YAMNet confounds for tropical forest insect/frog/bird patterns. Remap in downstream consumers."
+
 // MARK: - Data models
 
 struct ClassificationEvent: Codable {
@@ -32,14 +34,20 @@ struct ClassificationEvent: Codable {
 struct AnalysisResult: Codable {
     let source: String
     let durationSec: Double
+    let analyzerVersion: String
+    let analyzedAt: String
     let events: [ClassificationEvent]
     let summary: Summary
+    let confoundsNote: String
 
     enum CodingKeys: String, CodingKey {
         case source
-        case durationSec  = "duration_sec"
+        case durationSec    = "duration_sec"
+        case analyzerVersion = "analyzer_version"
+        case analyzedAt     = "analyzed_at"
         case events
         case summary
+        case confoundsNote  = "confounds_note"
     }
 
     struct Summary: Codable {
@@ -164,7 +172,15 @@ func buildSummary(from events: [ClassificationEvent]) -> AnalysisResult.Summary 
     )
 }
 
-// MARK: - ffmpeg decode to 16kHz mono WAV (fallback / simpler path)
+// MARK: - ISO8601 timestamp
+
+func iso8601Now() -> String {
+    let fmt = ISO8601DateFormatter()
+    fmt.formatOptions = [.withInternetDateTime]
+    return fmt.string(from: Date())
+}
+
+// MARK: - ffmpeg decode to 16kHz mono WAV
 
 func decodeTo16kMono(inputURL: URL) throws -> URL {
     let ffmpeg = findFFmpeg()
@@ -288,13 +304,27 @@ func analyzeFile(url: URL, source: String, confidenceThreshold: Double) async th
     print("  Clustered events: \(events.count)")
 
     let summary = buildSummary(from: events)
-    return AnalysisResult(source: source,
-                          durationSec: (durationSec * 10).rounded() / 10,
-                          events: events,
-                          summary: summary)
+    return AnalysisResult(
+        source: source,
+        durationSec: (durationSec * 10).rounded() / 10,
+        analyzerVersion: "apple-soundanalysis-v1",
+        analyzedAt: iso8601Now(),
+        events: events,
+        summary: summary,
+        confoundsNote: confoundsNote
+    )
 }
 
-// MARK: - R2 download
+// MARK: - R2 helpers
+
+func awsEnv() -> [String: String] {
+    [
+        "AWS_ACCESS_KEY_ID": r2AccessKey,
+        "AWS_SECRET_ACCESS_KEY": r2SecretKey,
+        "AWS_DEFAULT_REGION": r2Region,
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    ]
+}
 
 func downloadFromR2(r2Key: String, to localURL: URL) throws {
     let src = "s3://\(r2Bucket)/\(r2Key)"
@@ -304,12 +334,7 @@ func downloadFromR2(r2Key: String, to localURL: URL) throws {
     p.arguments = ["s3", "cp", src, localURL.path,
                    "--endpoint-url", r2Endpoint,
                    "--region", r2Region, "--no-progress"]
-    p.environment = [
-        "AWS_ACCESS_KEY_ID": r2AccessKey,
-        "AWS_SECRET_ACCESS_KEY": r2SecretKey,
-        "AWS_DEFAULT_REGION": r2Region,
-        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-    ]
+    p.environment = awsEnv()
     let errPipe = Pipe()
     p.standardOutput = Pipe()
     p.standardError  = errPipe
@@ -325,20 +350,54 @@ func downloadFromR2(r2Key: String, to localURL: URL) throws {
     print("  Downloaded \(localURL.lastPathComponent) (\(size / 1_048_576) MB)")
 }
 
+func uploadToR2(localURL: URL, r2Key: String) throws {
+    let dst = "s3://\(r2Bucket)/\(r2Key)"
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: awsPath)
+    p.arguments = ["s3", "cp", localURL.path, dst,
+                   "--endpoint-url", r2Endpoint,
+                   "--region", r2Region, "--no-progress",
+                   "--content-type", "application/json"]
+    p.environment = awsEnv()
+    let errPipe = Pipe()
+    p.standardOutput = Pipe()
+    p.standardError  = errPipe
+    try p.run()
+    p.waitUntilExit()
+    if p.terminationStatus != 0 {
+        let msg = (try? errPipe.fileHandleForReading.readToEnd())
+            .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        throw NSError(domain: "aws", code: Int(p.terminationStatus),
+                      userInfo: [NSLocalizedDescriptionKey: "aws s3 cp upload failed: \(msg)"])
+    }
+}
+
+/// Returns true if the given R2 key exists (head-object check).
+func r2KeyExists(_ key: String) -> Bool {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: awsPath)
+    p.arguments = ["s3api", "head-object",
+                   "--bucket", r2Bucket,
+                   "--key", key,
+                   "--endpoint-url", r2Endpoint,
+                   "--region", r2Region]
+    p.environment = awsEnv()
+    p.standardOutput = Pipe()
+    p.standardError  = Pipe()
+    try? p.run()
+    p.waitUntilExit()
+    return p.terminationStatus == 0
+}
+
 /// List all bed.m4a keys under stems/spatial-mix/field-recording/
-func listAllFieldRecordingBeds() throws -> [(key: String, slug: String)] {
+func listAllFieldRecordingBeds() throws -> [(key: String, slug: String, prefix: String)] {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: awsPath)
     p.arguments = ["s3", "ls", "s3://\(r2Bucket)/stems/spatial-mix/field-recording/",
                    "--recursive",
                    "--endpoint-url", r2Endpoint,
                    "--region", r2Region]
-    p.environment = [
-        "AWS_ACCESS_KEY_ID": r2AccessKey,
-        "AWS_SECRET_ACCESS_KEY": r2SecretKey,
-        "AWS_DEFAULT_REGION": r2Region,
-        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-    ]
+    p.environment = awsEnv()
     let outPipe = Pipe()
     p.standardOutput = outPipe
     p.standardError  = Pipe()
@@ -347,16 +406,18 @@ func listAllFieldRecordingBeds() throws -> [(key: String, slug: String)] {
     let output = (try? outPipe.fileHandleForReading.readToEnd())
         .flatMap { String(data: $0, encoding: .utf8) } ?? ""
 
-    var results: [(key: String, slug: String)] = []
+    var results: [(key: String, slug: String, prefix: String)] = []
     for line in output.components(separatedBy: "\n") {
         // Format: "2026-05-15 18:31:07   84322633 stems/spatial-mix/..."
         let parts = line.split(separator: " ", omittingEmptySubsequences: true)
         guard parts.count >= 4 else { continue }
         let key = String(parts[3])
         guard key.hasSuffix("/bed.m4a") else { continue }
-        // Slug = last directory component before bed.m4a
+        // prefix = everything up to and including the trailing slash before bed.m4a
+        let prefix = String(key.dropLast("bed.m4a".count))
+        // Slug = last non-empty directory component
         let slug = key.components(separatedBy: "/").dropLast().last ?? key
-        results.append((key, slug))
+        results.append((key, slug, prefix))
     }
     return results
 }
@@ -368,6 +429,97 @@ func writeJSON(_ result: AnalysisResult, to url: URL) throws {
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let data = try encoder.encode(result)
     try data.write(to: url)
+}
+
+// MARK: - Catalog update
+
+struct CatalogAnalysisFields {
+    let slug: String
+    let analyzedAt: String
+    let analyzerVersion: String
+    let dominantCategories: [String]
+    let uniqueLabelCount: Int
+}
+
+func downloadCatalog(to localURL: URL) throws {
+    let src = "s3://\(r2Bucket)/catalog.json"
+    print("  Downloading catalog.json …")
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: awsPath)
+    p.arguments = ["s3", "cp", src, localURL.path,
+                   "--endpoint-url", r2Endpoint,
+                   "--region", r2Region, "--no-progress"]
+    p.environment = awsEnv()
+    let errPipe = Pipe()
+    p.standardOutput = Pipe()
+    p.standardError  = errPipe
+    try p.run()
+    p.waitUntilExit()
+    if p.terminationStatus != 0 {
+        let msg = (try? errPipe.fileHandleForReading.readToEnd())
+            .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        throw NSError(domain: "aws", code: Int(p.terminationStatus),
+                      userInfo: [NSLocalizedDescriptionKey: "catalog download failed: \(msg)"])
+    }
+}
+
+func uploadCatalog(from localURL: URL) throws {
+    let dst = "s3://\(r2Bucket)/catalog.json"
+    print("  Uploading catalog.json …")
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: awsPath)
+    p.arguments = ["s3", "cp", localURL.path, dst,
+                   "--endpoint-url", r2Endpoint,
+                   "--region", r2Region, "--no-progress",
+                   "--content-type", "application/json"]
+    p.environment = awsEnv()
+    let errPipe = Pipe()
+    p.standardOutput = Pipe()
+    p.standardError  = errPipe
+    try p.run()
+    p.waitUntilExit()
+    if p.terminationStatus != 0 {
+        let msg = (try? errPipe.fileHandleForReading.readToEnd())
+            .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        throw NSError(domain: "aws", code: Int(p.terminationStatus),
+                      userInfo: [NSLocalizedDescriptionKey: "catalog upload failed: \(msg)"])
+    }
+}
+
+/// Merge analysis fields into catalog.json for each slug, then upload.
+func updateCatalog(with analyses: [CatalogAnalysisFields], catalogLocalURL: URL) throws {
+    let data = try Data(contentsOf: catalogLocalURL)
+    guard var catalog = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw NSError(domain: "catalog", code: 1, userInfo: [NSLocalizedDescriptionKey: "catalog.json is not a JSON object"])
+    }
+
+    guard var tracks = catalog["tracks"] as? [[String: Any]] else {
+        throw NSError(domain: "catalog", code: 2, userInfo: [NSLocalizedDescriptionKey: "catalog.json has no 'tracks' array"])
+    }
+
+    // Build lookup by slug
+    var bySlug: [String: CatalogAnalysisFields] = [:]
+    for a in analyses { bySlug[a.slug] = a }
+
+    var updatedCount = 0
+    for i in 0..<tracks.count {
+        guard let id = tracks[i]["id"] as? String, let fields = bySlug[id] else { continue }
+        tracks[i]["analyzed_at"]         = fields.analyzedAt
+        tracks[i]["analyzer_version"]    = fields.analyzerVersion
+        tracks[i]["dominant_categories"] = fields.dominantCategories
+        tracks[i]["unique_label_count"]  = fields.uniqueLabelCount
+        updatedCount += 1
+    }
+
+    catalog["tracks"] = tracks
+    // Bump the updated timestamp
+    let fmt = ISO8601DateFormatter()
+    fmt.formatOptions = [.withInternetDateTime]
+    catalog["updated"] = fmt.string(from: Date())
+
+    let outData = try JSONSerialization.data(withJSONObject: catalog, options: [.prettyPrinted, .sortedKeys])
+    try outData.write(to: catalogLocalURL)
+    print("  Updated \(updatedCount)/\(analyses.count) track entries in catalog.json")
 }
 
 // MARK: - Entry point
@@ -392,17 +544,178 @@ func ensureDir(_ url: URL) {
     try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
 }
 
+// MARK: - bulk-r2 subcommand
+
+func runBulkR2(dryRun: Bool, force: Bool) async {
+    print("=== bulk-r2 \(dryRun ? "(--dry-run)" : "") ===\n")
+
+    // Step 1: List all bed.m4a slugs in R2
+    print("Listing field-recording bed.m4a files in R2 …")
+    let allBeds: [(key: String, slug: String, prefix: String)]
+    do {
+        allBeds = try listAllFieldRecordingBeds()
+    } catch {
+        fputs("FATAL: cannot list R2 objects: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+    print("Found \(allBeds.count) bed.m4a file(s)\n")
+
+    // Step 2: Idempotency check — skip slugs that already have events.json
+    var toProcess: [(key: String, slug: String, prefix: String)] = []
+    var skippedSlugs: [String] = []
+
+    for bed in allBeds {
+        let eventsKey = bed.prefix + "events.json"
+        if !force && r2KeyExists(eventsKey) {
+            skippedSlugs.append(bed.slug)
+            print("  SKIP  \(bed.slug)  (events.json already in R2)")
+        } else {
+            toProcess.append(bed)
+        }
+    }
+
+    print("\n\(toProcess.count) to process, \(skippedSlugs.count) already done.")
+
+    // Apply 30-slug cap
+    let cap = 30
+    var remaining = 0
+    if toProcess.count > cap {
+        remaining = toProcess.count - cap
+        toProcess = Array(toProcess.prefix(cap))
+        print("Capping to \(cap) slugs this run. Remaining after run: \(remaining)")
+    }
+
+    if dryRun {
+        print("\n[dry-run] Would process:")
+        for (i, bed) in toProcess.enumerated() {
+            print("  [\(i+1)/\(toProcess.count)] \(bed.slug)")
+            print("           bed  → \(bed.key)")
+            print("           events.json → \(bed.prefix)events.json")
+        }
+        if remaining > 0 {
+            print("\nRemaining (beyond cap): \(remaining) slugs")
+        }
+        print("\n[dry-run] No files downloaded or uploaded.")
+        return
+    }
+
+    // Step 3: Process each slug
+    var catalogUpdates: [CatalogAnalysisFields] = []
+    var totalEvents = 0
+
+    for (i, bed) in toProcess.enumerated() {
+        print("\n[\(i+1)/\(toProcess.count)] processing \(bed.slug)/")
+        let tmpBed = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString + ".m4a")
+        let tmpEvents = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString + "-events.json")
+
+        // Download bed.m4a
+        do {
+            try downloadFromR2(r2Key: bed.key, to: tmpBed)
+        } catch {
+            fputs("  ERROR [\(bed.slug)] download failed: \(error.localizedDescription)\n", stderr)
+            continue
+        }
+
+        // Analyze
+        let result: AnalysisResult
+        do {
+            result = try await analyzeFile(
+                url: tmpBed,
+                source: bed.key,
+                confidenceThreshold: 0.3
+            )
+        } catch {
+            fputs("  ERROR [\(bed.slug)] analysis failed: \(error.localizedDescription)\n", stderr)
+            try? FileManager.default.removeItem(at: tmpBed)
+            continue
+        }
+
+        // Delete local temp bed immediately — don't fill disk
+        try? FileManager.default.removeItem(at: tmpBed)
+
+        // Write events.json locally
+        do {
+            try writeJSON(result, to: tmpEvents)
+        } catch {
+            fputs("  ERROR [\(bed.slug)] write events.json failed: \(error.localizedDescription)\n", stderr)
+            continue
+        }
+
+        // Upload events.json to R2
+        let eventsR2Key = bed.prefix + "events.json"
+        do {
+            try uploadToR2(localURL: tmpEvents, r2Key: eventsR2Key)
+        } catch {
+            fputs("  ERROR [\(bed.slug)] upload failed: \(error.localizedDescription)\n", stderr)
+            try? FileManager.default.removeItem(at: tmpEvents)
+            continue
+        }
+        try? FileManager.default.removeItem(at: tmpEvents)
+
+        let eventCount = result.events.count
+        totalEvents += eventCount
+        let top5 = result.summary.topCategories.prefix(5).map(\.label)
+        print("  → \(eventCount) events found → uploaded")
+        print("    top: \(top5.joined(separator: ", "))")
+
+        // Collect for catalog update
+        catalogUpdates.append(CatalogAnalysisFields(
+            slug: bed.slug,
+            analyzedAt: result.analyzedAt,
+            analyzerVersion: result.analyzerVersion,
+            dominantCategories: Array(top5),
+            uniqueLabelCount: result.summary.uniqueLabels
+        ))
+    }
+
+    // Step 4: Update catalog.json (single merge at end)
+    if !catalogUpdates.isEmpty {
+        print("\n=== Updating catalog.json ===")
+        let tmpCatalog = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("catalog-bulk-r2-\(UUID().uuidString).json")
+        do {
+            try downloadCatalog(to: tmpCatalog)
+            try updateCatalog(with: catalogUpdates, catalogLocalURL: tmpCatalog)
+            try uploadCatalog(from: tmpCatalog)
+            try? FileManager.default.removeItem(at: tmpCatalog)
+            print("  catalog.json updated with \(catalogUpdates.count) slug(s)")
+        } catch {
+            fputs("ERROR updating catalog.json: \(error.localizedDescription)\n", stderr)
+            try? FileManager.default.removeItem(at: tmpCatalog)
+        }
+    }
+
+    print("\n=== bulk-r2 complete ===")
+    print("Processed: \(catalogUpdates.count)/\(toProcess.count) slugs")
+    print("Total events across all uploads: \(totalEvents)")
+    if remaining > 0 {
+        print("Remaining (run again to continue): \(remaining) slugs")
+    }
+}
+
+// MARK: - Argument parsing & dispatch
+
 let args = CommandLine.arguments.dropFirst()
 
 enum Mode {
     case localFile(URL)
     case r2Prefix(String)
     case allFieldRecordings
+    case bulkR2(dryRun: Bool, force: Bool)
 }
 
 func parseMode() -> Mode? {
-    var argList = Array(args)
-    if argList.isEmpty { return nil }
+    let argList = Array(args)
+    guard !argList.isEmpty else { return nil }
+
+    // bulk-r2 subcommand
+    if argList[0] == "bulk-r2" {
+        let dryRun = argList.contains("--dry-run")
+        let force  = argList.contains("--force")
+        return .bulkR2(dryRun: dryRun, force: force)
+    }
 
     if argList[0] == "--all-field-recordings" {
         return .allFieldRecordings
@@ -427,10 +740,19 @@ guard let mode = parseMode() else {
       analyze-bed <local-path>                               # analyze a local bed.m4a
       analyze-bed <r2-key-prefix>                            # e.g. stems/spatial-mix/.../<slug>/
       analyze-bed --r2-prefix <prefix>                       # same
-      analyze-bed --all-field-recordings                     # process everything in R2
+      analyze-bed --all-field-recordings                     # process everything in R2 (local output only)
+      analyze-bed bulk-r2 [--dry-run] [--force]              # bulk: analyze R2, upload events.json, update catalog
     """)
     exit(1)
 }
+
+// bulk-r2 path — dispatch and exit
+if case .bulkR2(let dryRun, let force) = mode {
+    await runBulkR2(dryRun: dryRun, force: force)
+    exit(0)
+}
+
+// ---- Legacy single/multi-file local paths below ----
 
 // Collect (r2Key?, localURL, slug, outputURL)
 struct Job {
@@ -468,6 +790,10 @@ case .allFieldRecordings:
         let outputURL = resultsDir.appendingPathComponent("\(bed.slug).events.json")
         jobs.append(Job(r2Key: bed.key, localURL: tmp, slug: bed.slug, outputURL: outputURL))
     }
+
+case .bulkR2:
+    // handled above
+    break
 }
 
 // Run all jobs
