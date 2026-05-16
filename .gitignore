@@ -1,6 +1,8 @@
 .build/
 .swiftpm/
 DerivedData/
+# species classifier venv — large, install via README
+.species-env/
 # track JSON results but not audio files
 results/*.m4a
 results/*.wav
