@@ -387,7 +387,19 @@ struct BirdNetDetection {
     let confidence: Double
 }
 
-/// Run BirdNET on audioFile, returning detections with confidence >= 0.5.
+/// Minimum confidence threshold for BirdNET detections (lowered to 0.25 for better recall).
+private let birdnetMinConf: Double = 0.25
+
+/// BirdNET overlap parameter (0.5 = 1.5s step instead of 3s, catches briefly-calling species).
+private let birdnetOverlap: Double = 0.5
+
+/// Frequency bands to run BirdNET on for source-separation pre-split.
+/// low=500–2500Hz (large birds/doves/owls), mid=2000–6000Hz (passerines), high=5000–12000Hz (insects/hummingbirds).
+/// Bands overlap intentionally. "full" is the unprocessed signal.
+private let birdnetBands: String = "low,mid,high,full"
+
+/// Run BirdNET on audioFile, returning detections with confidence >= birdnetMinConf.
+/// Uses frequency-band pre-split (4 passes) + 0.5 overlap for improved recall in dense recordings.
 /// Passes bird window time ranges to Python so it only keeps detections overlapping those windows.
 func runBirdNet(audioURL: URL,
                 birdWindows: [(start: Double, end: Double)],
@@ -403,14 +415,24 @@ func runBirdNet(audioURL: URL,
         .appendingPathComponent(UUID().uuidString + "-birdnet.json")
     defer { try? FileManager.default.removeItem(at: tmpOut) }
 
-    print("  [BirdNET] Running species classifier (lat=\(loc.lat), lon=\(loc.lon), date=\(date)) …")
+    print("  [BirdNET] Running species classifier (lat=\(loc.lat), lon=\(loc.lon), date=\(date))")
+    print("  [BirdNET] overlap=\(birdnetOverlap), min_conf=\(birdnetMinConf), bands=\(birdnetBands)")
     print("  [BirdNET] Bird windows: \(birdWindows.count), python=\(python)")
 
     let p = Process()
     p.executableURL = URL(fileURLWithPath: python)
-    // Pass the full file — BirdNET segments internally; we filter by window in post
-    p.arguments = [script, audioURL.path, tmpOut.path,
-                   String(loc.lat), String(loc.lon), date]
+    // Pass the full file — Python handles band splitting + BirdNET segmentation internally
+    p.arguments = [
+        script,
+        audioURL.path,
+        tmpOut.path,
+        String(loc.lat),
+        String(loc.lon),
+        date,
+        "--overlap",  String(birdnetOverlap),
+        "--min-conf", String(birdnetMinConf),
+        "--bands",    birdnetBands,
+    ]
     let outPipe = Pipe()
     let errPipe = Pipe()
     p.standardOutput = outPipe
@@ -423,19 +445,23 @@ func runBirdNet(audioURL: URL,
     }
     p.waitUntilExit()
 
-    // Echo BirdNET stdout for monitoring
+    // Echo BirdNET stdout/stderr for monitoring
     if let outData = try? outPipe.fileHandleForReading.readToEnd(),
        let outStr  = String(data: outData, encoding: .utf8), !outStr.isEmpty {
         outStr.components(separatedBy: "\n").forEach {
             if !$0.isEmpty { print("  [BirdNET] \($0)") }
         }
     }
+    if let errData = try? errPipe.fileHandleForReading.readToEnd(),
+       let errStr  = String(data: errData, encoding: .utf8), !errStr.isEmpty {
+        // Print band-level stderr lines (they're informational, not fatal)
+        errStr.components(separatedBy: "\n").forEach {
+            if !$0.isEmpty { print("  [BirdNET-band] \($0)") }
+        }
+    }
 
     if p.terminationStatus != 0 {
-        if let errData = try? errPipe.fileHandleForReading.readToEnd(),
-           let errStr  = String(data: errData, encoding: .utf8) {
-            fputs("  [BirdNET] ERROR (exit \(p.terminationStatus)):\n\(errStr)\n", stderr)
-        }
+        fputs("  [BirdNET] ERROR: Python exited with status \(p.terminationStatus)\n", stderr)
         return []
     }
 
@@ -454,7 +480,7 @@ func runBirdNet(audioURL: URL,
               let start   = item["start_sec"]   as? Double,
               let end     = item["end_sec"]     as? Double,
               let conf    = item["confidence"]  as? Double,
-              conf >= 0.5
+              conf >= birdnetMinConf
         else { continue }
 
         // Filter: only keep detections whose window overlaps a bird-flagged Apple window
@@ -609,7 +635,7 @@ func analyzeFile(url: URL, source: String, confidenceThreshold: Double,
 
     let summary = buildSummary(from: allEvents, speciesRecords: speciesRecords)
     let analyzerVersion = withSpecies
-        ? "apple-soundanalysis-v1+birdnet-v2.4"
+        ? "apple-soundanalysis-v1+birdnet-v2.4-bandsplit-overlap0.5"
         : "apple-soundanalysis-v1"
 
     return AnalysisResult(
@@ -1064,11 +1090,17 @@ func parseMode() -> Mode? {
 guard let mode = parseMode() else {
     print("""
     usage:
-      analyze-bed <local-path>                                         # analyze a local bed.m4a
-      analyze-bed <r2-key-prefix>                                      # e.g. stems/spatial-mix/.../<slug>/
-      analyze-bed --r2-prefix <prefix>                                 # same
-      analyze-bed --all-field-recordings                               # process everything in R2 (local output only)
-      analyze-bed bulk-r2 [--dry-run] [--force] [--with-species]      # bulk: analyze R2, upload events.json + catalog
+      analyze-bed <local-path>                                              # analyze a local bed.m4a
+      analyze-bed <r2-key-prefix>                                           # e.g. stems/spatial-mix/.../<slug>/
+      analyze-bed --r2-prefix <prefix>                                      # same
+      analyze-bed --all-field-recordings                                    # process everything in R2 (local output only)
+      analyze-bed bulk-r2 [--dry-run] [--force] [--with-species]           # bulk: analyze R2, upload events.json + catalog
+
+    Species pass (--with-species) uses:
+      - BirdNET overlap=0.5 (1.5 s step, catches briefly-calling species)
+      - min_conf=0.25 (vs 0.5 previously — usable precision for cataloging)
+      - 4-band pre-split: low(500-2500Hz) + mid(2000-6000Hz) + high(5000-12000Hz) + full
+        Bands overlap intentionally. Per-band temp wavs are deleted after analysis.
     """)
     exit(1)
 }
