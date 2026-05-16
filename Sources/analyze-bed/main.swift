@@ -2238,6 +2238,550 @@ func runGenerateTimelines(
     }
 }
 
+// MARK: - Source catalog models
+
+struct SourceCatalogSample: Codable {
+    let file: String
+    let startSec: Double
+    let endSec: Double
+    let durationSec: Double
+    let confidence: Double
+
+    enum CodingKeys: String, CodingKey {
+        case file
+        case startSec    = "start_sec"
+        case endSec      = "end_sec"
+        case durationSec = "duration_sec"
+        case confidence
+    }
+}
+
+struct SourceCatalogSpecies: Codable {
+    let common: String
+    let scientific: String
+    let slug: String
+    let sampleCount: Int
+    let maxConfidence: Double
+    let samples: [SourceCatalogSample]
+
+    enum CodingKeys: String, CodingKey {
+        case common
+        case scientific
+        case slug
+        case sampleCount   = "sample_count"
+        case maxConfidence = "max_confidence"
+        case samples
+    }
+}
+
+struct SourceCatalog: Codable {
+    let version: Int
+    let sourceSlug: String
+    let sourceRecording: String
+    let durationSec: Double
+    let generatedAt: String
+    let speciesCount: Int
+    let sampleCount: Int
+    let species: [SourceCatalogSpecies]
+
+    enum CodingKeys: String, CodingKey {
+        case version
+        case sourceSlug      = "source_slug"
+        case sourceRecording = "source_recording"
+        case durationSec     = "duration_sec"
+        case generatedAt     = "generated_at"
+        case speciesCount    = "species_count"
+        case sampleCount     = "sample_count"
+        case species
+    }
+}
+
+struct SourceIndexEntry: Codable {
+    let slug: String
+    let durationSec: Double
+    let speciesCount: Int
+    let sampleCount: Int
+    let catalogJson: String
+    let catalogMd: String
+
+    enum CodingKeys: String, CodingKey {
+        case slug
+        case durationSec  = "duration_sec"
+        case speciesCount = "species_count"
+        case sampleCount  = "sample_count"
+        case catalogJson  = "catalog_json"
+        case catalogMd    = "catalog_md"
+    }
+}
+
+// MARK: - Source catalog markdown generator
+
+func buildSourceCatalogMarkdown(catalog: SourceCatalog) -> String {
+    var md = ""
+
+    // Derive a human-readable title from slug
+    let title: String = {
+        var s = catalog.sourceSlug
+        // Remove trailing hash component (last dash-hex-6)
+        if let range = s.range(of: #"-[0-9a-f]{6}$"#, options: .regularExpression) {
+            s = String(s[s.startIndex..<range.lowerBound])
+        }
+        // Replace dashes with spaces, title-case
+        return s.split(separator: "-").map { w in
+            w.prefix(1).uppercased() + w.dropFirst()
+        }.joined(separator: " ")
+    }()
+
+    let totalDur = catalog.durationSec
+    let h = Int(totalDur) / 3600
+    let m = (Int(totalDur) % 3600) / 60
+    let s = Int(totalDur) % 60
+    let durDisplay = h > 0
+        ? String(format: "%d:%02d:%02d", h, m, s)
+        : String(format: "%02d:%02d", m, s)
+
+    md += "# \(title) — Bird Catalog\n\n"
+    md += "**Recording:** \(catalog.sourceSlug)\n"
+    md += "**Duration:** \(durDisplay) (\(Int(totalDur))s)\n"
+    md += "**Species detected:** \(catalog.speciesCount)\n"
+    md += "**Sample clips:** \(catalog.sampleCount)\n"
+
+    if catalog.species.isEmpty {
+        md += "\n*(No bird species with samples found in this recording.)*\n"
+        return md
+    }
+
+    md += "\n## Species\n"
+
+    for sp in catalog.species {
+        let maxConfStr = String(format: "%.2f", sp.maxConfidence)
+        md += "\n### \(sp.common) (*\(sp.scientific)*)\n"
+        md += "\(sp.sampleCount) clip\(sp.sampleCount == 1 ? "" : "s") · max confidence \(maxConfStr)\n\n"
+        md += "| Time | Duration | Confidence | Sample |\n"
+        md += "|---|---|---|---|\n"
+        for sample in sp.samples {
+            let tDisp = formatTime(sample.startSec, totalDuration: totalDur)
+            let durStr = String(format: "%.1fs", sample.durationSec)
+            let confStr = String(format: "%.2f", sample.confidence)
+            md += "| \(tDisp) | \(durStr) | \(confStr) | [→](\(sample.file)) |\n"
+        }
+    }
+
+    return md
+}
+
+// MARK: - generate-source-catalogs subcommand
+
+func runGenerateSourceCatalogs(
+    allR2: Bool,
+    slugFilter: String?,
+    dryRun: Bool,
+    force: Bool
+) {
+    print("=== generate-source-catalogs \(dryRun ? "(--dry-run)" : "") ===\n")
+
+    // 1. Load samples/index.json — build lookup: sourceSlug → [file paths] per speciesSlug
+    print("Downloading samples/index.json …")
+    let tmpIndex = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("samples-index-src-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: tmpIndex) }
+
+    do {
+        try downloadFromR2(r2Key: "samples/index.json", to: tmpIndex)
+    } catch {
+        fputs("FATAL: cannot download samples/index.json: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+
+    // Parse index into a lookup: (sourceSlug, speciesSlug) → [SampleIndexEntry]
+    struct IndexKey: Hashable { let source: String; let species: String }
+    var sampleLookup: [IndexKey: [SampleIndexEntry]] = [:]
+
+    do {
+        let raw = try Data(contentsOf: tmpIndex)
+        guard let parsed = try JSONSerialization.jsonObject(with: raw) as? [String: Any] else {
+            fputs("FATAL: samples/index.json not a JSON object\n", stderr)
+            exit(1)
+        }
+        guard let speciesArr = parsed["species"] as? [[String: Any]] else {
+            fputs("FATAL: samples/index.json missing species array\n", stderr)
+            exit(1)
+        }
+        for spDict in speciesArr {
+            guard let spSlug   = spDict["slug"]    as? String,
+                  let samples  = spDict["samples"] as? [[String: Any]] else { continue }
+            for sDict in samples {
+                guard let file      = sDict["file"]        as? String,
+                      let srcSlug   = sDict["source_slug"] as? String,
+                      let startSec  = sDict["start_sec"]   as? Double,
+                      let endSec    = sDict["end_sec"]     as? Double,
+                      let durSec    = sDict["duration_sec"] as? Double,
+                      let conf      = sDict["confidence"]  as? Double else { continue }
+                let entry = SampleIndexEntry(
+                    file: file, sourceSlug: srcSlug,
+                    startSec: startSec, endSec: endSec,
+                    durationSec: durSec, confidence: conf
+                )
+                let key = IndexKey(source: srcSlug, species: spSlug)
+                sampleLookup[key, default: []].append(entry)
+            }
+        }
+    } catch {
+        fputs("FATAL: parsing samples/index.json: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+
+    print("  Loaded index: \(sampleLookup.values.reduce(0) { $0 + $1.count }) sample entries across \(sampleLookup.keys.map(\.source).reduce(into: Set<String>()) { $0.insert($1) }.count) source(s)\n")
+
+    // 2. Find all events.json files
+    print("Listing events.json files in R2 …")
+    let allEventsFiles: [(eventsKey: String, bedKey: String, slug: String, prefix: String)]
+    do {
+        allEventsFiles = try listAllFieldRecordingEventsJSON()
+    } catch {
+        fputs("FATAL: cannot list R2 objects: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+
+    var toProcess = allEventsFiles
+    if let sf = slugFilter {
+        toProcess = toProcess.filter { $0.slug == sf }
+        if toProcess.isEmpty {
+            fputs("No events.json found for slug '\(sf)'\n", stderr)
+            exit(1)
+        }
+    }
+    print("Found \(toProcess.count) events.json file(s)\n")
+
+    // 3. Idempotency check
+    var toGenerate: [(eventsKey: String, bedKey: String, slug: String, prefix: String)] = []
+    var skippedSlugs: [String] = []
+
+    for ef in toProcess {
+        let catalogKey = "samples/by-source/\(ef.slug)/catalog.json"
+        if !force && r2KeyExists(catalogKey) {
+            skippedSlugs.append(ef.slug)
+            print("  SKIP  \(ef.slug)  (catalog.json already in R2)")
+        } else {
+            toGenerate.append(ef)
+        }
+    }
+    print("\n\(toGenerate.count) to generate, \(skippedSlugs.count) already done.")
+
+    if dryRun {
+        print("\n[dry-run] Would process:")
+        for (i, ef) in toGenerate.enumerated() {
+            print("  [\(i+1)/\(toGenerate.count)] \(ef.slug)")
+            print("           events.json → \(ef.eventsKey)")
+            print("           catalog.json → samples/by-source/\(ef.slug)/catalog.json")
+            print("           catalog.md   → samples/by-source/\(ef.slug)/catalog.md")
+        }
+        print("\n[dry-run] No files uploaded.")
+        return
+    }
+
+    // 4. Process each slug
+    var sourceEntries: [SourceIndexEntry] = []
+    var processedWithBirds: [String] = []
+    var processedEmpty: [String] = []
+    var failed: [String] = []
+
+    for (i, ef) in toGenerate.enumerated() {
+        print("\n[\(i+1)/\(toGenerate.count)] \(ef.slug)")
+
+        // Download events.json
+        let tmpEvents = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString + "-events.json")
+        defer { try? FileManager.default.removeItem(at: tmpEvents) }
+
+        do {
+            try downloadFromR2(r2Key: ef.eventsKey, to: tmpEvents)
+        } catch {
+            fputs("  ERROR [\(ef.slug)] download events.json: \(error.localizedDescription)\n", stderr)
+            failed.append(ef.slug)
+            continue
+        }
+
+        let rawData: Data
+        let rawDict: [String: Any]
+        do {
+            rawData = try Data(contentsOf: tmpEvents)
+            guard let parsed = try JSONSerialization.jsonObject(with: rawData) as? [String: Any] else {
+                fputs("  ERROR [\(ef.slug)] events.json not a JSON object\n", stderr)
+                failed.append(ef.slug)
+                continue
+            }
+            rawDict = parsed
+        } catch {
+            fputs("  ERROR [\(ef.slug)] parse events.json: \(error.localizedDescription)\n", stderr)
+            failed.append(ef.slug)
+            continue
+        }
+
+        let durationSec = rawDict["duration_sec"] as? Double ?? 0
+        guard let rawEvents = rawDict["events"] as? [[String: Any]] else {
+            fputs("  ERROR [\(ef.slug)] no events array\n", stderr)
+            failed.append(ef.slug)
+            continue
+        }
+
+        // Collect BirdNET events with confidence >= 0.5
+        var birdnetEvents: [ClassificationEvent] = []
+        for raw in rawEvents {
+            guard let src     = raw["source"]            as? String, src == "birdnet",
+                  let startSec = raw["start_sec"]        as? Double,
+                  let endSec   = raw["end_sec"]          as? Double,
+                  let conf     = raw["confidence"]       as? Double, conf >= 0.5,
+                  let common   = raw["species_common"]   as? String,
+                  let sci      = raw["species_scientific"] as? String
+            else { continue }
+            birdnetEvents.append(ClassificationEvent(
+                startSec: startSec, endSec: endSec,
+                speciesCommon: common, speciesScientific: sci,
+                confidence: conf
+            ))
+        }
+
+        print("  BirdNET events (≥0.5): \(birdnetEvents.count)")
+
+        if birdnetEvents.isEmpty {
+            print("  No birds — skipping catalog write")
+            processedEmpty.append(ef.slug)
+            continue
+        }
+
+        // Cluster events by species (same logic as extract-samples)
+        let clusters = clusterBirdNetEvents(
+            events: birdnetEvents,
+            minConf: 0.5,
+            padding: 3.0,
+            durationSec: durationSec,
+            sourceSlug: ef.slug,
+            maxPerSpecies: 30
+        )
+        print("  Clusters after de-dupe: \(clusters.count)")
+
+        // Build per-species catalog entries by looking up actual sample files
+        var bySpecies: [String: SourceCatalogSpecies] = [:]
+
+        for cluster in clusters {
+            let key = IndexKey(source: ef.slug, species: cluster.speciesSlug)
+            // Find matching sample from the index: match on source_slug + species + start_sec (within 0.5s tolerance)
+            let candidateSamples = sampleLookup[key] ?? []
+            // Find the best match: closest start_sec to cluster.clipStart
+            let matchedSample = candidateSamples.min(by: {
+                abs($0.startSec - cluster.clipStart) < abs($1.startSec - cluster.clipStart)
+            })
+
+            guard let sample = matchedSample,
+                  abs(sample.startSec - cluster.clipStart) < 5.0 else {
+                // No matching sample in index (cluster may have been skipped/filtered during extraction)
+                print("  WARN: no matching sample for \(cluster.speciesCommon) cluster at t=\(cluster.clipStart)s")
+                continue
+            }
+
+            let catalogSample = SourceCatalogSample(
+                file: sample.file,
+                startSec: sample.startSec,
+                endSec: sample.endSec,
+                durationSec: sample.durationSec,
+                confidence: sample.confidence
+            )
+
+            if let existing = bySpecies[cluster.speciesSlug] {
+                var newSamples = existing.samples
+                // Avoid duplicate files
+                if !newSamples.contains(where: { $0.file == catalogSample.file }) {
+                    newSamples.append(catalogSample)
+                }
+                let newMax = max(existing.maxConfidence, catalogSample.confidence)
+                bySpecies[cluster.speciesSlug] = SourceCatalogSpecies(
+                    common: existing.common,
+                    scientific: existing.scientific,
+                    slug: existing.slug,
+                    sampleCount: newSamples.count,
+                    maxConfidence: newMax,
+                    samples: newSamples
+                )
+            } else {
+                bySpecies[cluster.speciesSlug] = SourceCatalogSpecies(
+                    common: cluster.speciesCommon,
+                    scientific: cluster.speciesScientific,
+                    slug: cluster.speciesSlug,
+                    sampleCount: 1,
+                    maxConfidence: catalogSample.confidence,
+                    samples: [catalogSample]
+                )
+            }
+        }
+
+        // Sort species by sample_count desc, samples within each by confidence desc
+        var speciesList = Array(bySpecies.values).sorted { $0.sampleCount > $1.sampleCount }
+        for i in 0..<speciesList.count {
+            let sorted = speciesList[i].samples.sorted { $0.confidence > $1.confidence }
+            speciesList[i] = SourceCatalogSpecies(
+                common: speciesList[i].common,
+                scientific: speciesList[i].scientific,
+                slug: speciesList[i].slug,
+                sampleCount: sorted.count,
+                maxConfidence: speciesList[i].maxConfidence,
+                samples: sorted
+            )
+        }
+
+        let totalSamples = speciesList.reduce(0) { $0 + $1.sampleCount }
+
+        // Derive source_recording path prefix
+        let sourceRecordingPath = ef.prefix
+
+        let catalog = SourceCatalog(
+            version: 1,
+            sourceSlug: ef.slug,
+            sourceRecording: sourceRecordingPath,
+            durationSec: (durationSec * 10).rounded() / 10,
+            generatedAt: iso8601Now(),
+            speciesCount: speciesList.count,
+            sampleCount: totalSamples,
+            species: speciesList
+        )
+
+        if speciesList.isEmpty {
+            print("  No matched samples in index — skipping catalog write")
+            processedEmpty.append(ef.slug)
+            continue
+        }
+
+        // Encode catalog.json
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let jsonData: Data
+        do {
+            jsonData = try encoder.encode(catalog)
+        } catch {
+            fputs("  ERROR [\(ef.slug)] encode catalog.json: \(error.localizedDescription)\n", stderr)
+            failed.append(ef.slug)
+            continue
+        }
+
+        // Build catalog.md
+        let mdText = buildSourceCatalogMarkdown(catalog: catalog)
+        let mdData = mdText.data(using: .utf8) ?? Data()
+
+        // Upload catalog.json
+        let catalogJsonKey = "samples/by-source/\(ef.slug)/catalog.json"
+        let tmpCatalogJson = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString + "-catalog.json")
+        do {
+            try jsonData.write(to: tmpCatalogJson)
+            try uploadToR2(localURL: tmpCatalogJson, r2Key: catalogJsonKey)
+            try? FileManager.default.removeItem(at: tmpCatalogJson)
+            print("  → uploaded catalog.json (\(jsonData.count / 1024) KB, \(speciesList.count) species, \(totalSamples) samples)")
+        } catch {
+            try? FileManager.default.removeItem(at: tmpCatalogJson)
+            fputs("  ERROR [\(ef.slug)] upload catalog.json: \(error.localizedDescription)\n", stderr)
+            failed.append(ef.slug)
+            continue
+        }
+
+        // Upload catalog.md
+        let catalogMdKey = "samples/by-source/\(ef.slug)/catalog.md"
+        let tmpCatalogMd = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString + "-catalog.md")
+        do {
+            try mdData.write(to: tmpCatalogMd)
+            try uploadTextToR2(localURL: tmpCatalogMd, r2Key: catalogMdKey, contentType: "text/markdown")
+            try? FileManager.default.removeItem(at: tmpCatalogMd)
+            print("  → uploaded catalog.md (\(mdData.count / 1024) KB)")
+        } catch {
+            try? FileManager.default.removeItem(at: tmpCatalogMd)
+            fputs("  ERROR [\(ef.slug)] upload catalog.md: \(error.localizedDescription)\n", stderr)
+            // Non-fatal — json is already up
+        }
+
+        processedWithBirds.append(ef.slug)
+        sourceEntries.append(SourceIndexEntry(
+            slug: ef.slug,
+            durationSec: (durationSec * 10).rounded() / 10,
+            speciesCount: speciesList.count,
+            sampleCount: totalSamples,
+            catalogJson: catalogJsonKey,
+            catalogMd: catalogMdKey
+        ))
+    }
+
+    // 5. Update samples/index.json → v2 with sources section
+    print("\n=== Updating samples/index.json to v2 with sources section ===")
+    let tmpIndexDl = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("samples-index-v2-\(UUID().uuidString).json")
+    do {
+        try downloadFromR2(r2Key: "samples/index.json", to: tmpIndexDl)
+        let raw = try Data(contentsOf: tmpIndexDl)
+        guard var dict = try JSONSerialization.jsonObject(with: raw) as? [String: Any] else {
+            throw NSError(domain: "catalog", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "samples/index.json not a JSON object"])
+        }
+
+        // Bump version
+        dict["version"] = 2
+
+        // Build sources array — merge skipped entries (if they were already v2) + newly generated
+        var existingSources: [[String: Any]] = (dict["sources"] as? [[String: Any]]) ?? []
+        // Remove entries that we just regenerated (replace them)
+        let regeneratedSlugs = Set(sourceEntries.map(\.slug))
+        existingSources = existingSources.filter { !regeneratedSlugs.contains($0["slug"] as? String ?? "") }
+
+        // Add newly generated entries
+        let newEncoder = JSONEncoder()
+        newEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        for entry in sourceEntries {
+            existingSources.append([
+                "slug":          entry.slug,
+                "duration_sec":  entry.durationSec,
+                "species_count": entry.speciesCount,
+                "sample_count":  entry.sampleCount,
+                "catalog_json":  entry.catalogJson,
+                "catalog_md":    entry.catalogMd
+            ])
+        }
+
+        // Sort sources by slug
+        existingSources.sort {
+            ($0["slug"] as? String ?? "") < ($1["slug"] as? String ?? "")
+        }
+        dict["sources"] = existingSources
+
+        // Update generated_at
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime]
+        dict["generated_at"] = fmt.string(from: Date())
+
+        let outData = try JSONSerialization.data(withJSONObject: dict,
+                                                  options: [.prettyPrinted, .sortedKeys])
+        try outData.write(to: tmpIndexDl)
+        try uploadToR2(localURL: tmpIndexDl, r2Key: "samples/index.json")
+        try? FileManager.default.removeItem(at: tmpIndexDl)
+        print("  samples/index.json updated to v2 with \(existingSources.count) source entry/entries")
+    } catch {
+        fputs("ERROR updating samples/index.json: \(error.localizedDescription)\n", stderr)
+        try? FileManager.default.removeItem(at: tmpIndexDl)
+    }
+
+    // 6. Final summary
+    print("\n=== generate-source-catalogs complete ===")
+    print("Catalogs generated: \(processedWithBirds.count)")
+    for slug in processedWithBirds {
+        print("  \(slug)")
+    }
+    print("Skipped (zero birds): \(processedEmpty.count)")
+    for slug in processedEmpty {
+        print("  \(slug)")
+    }
+    if !failed.isEmpty {
+        print("Failures: \(failed.count)")
+        for slug in failed { print("  \(slug)") }
+    }
+}
+
 // MARK: - Argument parsing & dispatch
 
 let args = CommandLine.arguments.dropFirst()
@@ -2251,11 +2795,31 @@ enum Mode {
                         padding: Double, maxPerSpecies: Int, dryRun: Bool, force: Bool)
     case generateTimelines(allR2: Bool, slugFilter: String?, formats: Set<String>,
                            dryRun: Bool, force: Bool)
+    case generateSourceCatalogs(allR2: Bool, slugFilter: String?, dryRun: Bool, force: Bool)
 }
 
 func parseMode() -> Mode? {
     let argList = Array(args)
     guard !argList.isEmpty else { return nil }
+
+    if argList[0] == "generate-source-catalogs" {
+        let allR2  = argList.contains("--all-r2")
+        let dryRun = argList.contains("--dry-run")
+        let force  = argList.contains("--force")
+
+        var slugFilter: String? = nil
+        if let idx = argList.firstIndex(of: "--slug"), idx + 1 < argList.count {
+            slugFilter = argList[idx + 1]
+        }
+
+        guard allR2 || slugFilter != nil else {
+            fputs("generate-source-catalogs requires --all-r2 or --slug <slug>\n", stderr)
+            exit(1)
+        }
+
+        return .generateSourceCatalogs(allR2: allR2, slugFilter: slugFilter,
+                                       dryRun: dryRun, force: force)
+    }
 
     if argList[0] == "generate-timelines" {
         let allR2  = argList.contains("--all-r2")
@@ -2351,6 +2915,9 @@ guard let mode = parseMode() else {
                   [--max-per-species 30]
       analyze-bed generate-timelines --all-r2 [--dry-run] [--force]        # generate timeline.json + timeline.md per slug
                   [--slug <slug>] [--formats md,json]
+      analyze-bed generate-source-catalogs --all-r2 [--dry-run] [--force]  # per-recording bird catalogs
+                  [--slug <slug>]                                            # → samples/by-source/<slug>/catalog.{json,md}
+                                                                            # updates samples/index.json to v2
 
     Species pass (--with-species) uses:
       - BirdNET overlap=0.5 (1.5 s step, catches briefly-calling species)
@@ -2364,6 +2931,12 @@ guard let mode = parseMode() else {
 if case .generateTimelines(let allR2, let slugFilter, let formats, let dryRun, let force) = mode {
     runGenerateTimelines(allR2: allR2, slugFilter: slugFilter,
                          formats: formats, dryRun: dryRun, force: force)
+    exit(0)
+}
+
+if case .generateSourceCatalogs(let allR2, let slugFilter, let dryRun, let force) = mode {
+    runGenerateSourceCatalogs(allR2: allR2, slugFilter: slugFilter,
+                               dryRun: dryRun, force: force)
     exit(0)
 }
 
@@ -2426,6 +2999,9 @@ case .extractSamples:
     break  // handled above
 
 case .generateTimelines:
+    break  // handled above
+
+case .generateSourceCatalogs:
     break  // handled above
 }
 
